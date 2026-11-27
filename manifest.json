@@ -1,0 +1,10 @@
+{
+  "display_name": "聊天摘录",
+  "loading_order": 80,
+  "requires": [],
+  "js": "index.js",
+  "css": "style.css",
+  "version": "1.0.0",
+  "author": "kaelisvespera",
+  "homePage": "https://github.com/kaelisvespera/tavern-chat-clips"
+}
