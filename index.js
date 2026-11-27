@@ -55,6 +55,7 @@ body {
   const PREVIEW_HOST = '.TH-render, .xiaobaix-iframe-wrapper, .mes-code-preview';
   const STAGED_PREVIEW = '.mes-code-preview-placeholder, .mes-code-preview-pending';
   const frameLoads = new WeakMap();
+  const favoriteBodyLoads = new WeakMap();
   const READING_SIZE_KEY = 'th-chat-search-reading-size';
   const READING_SIZE_DEFAULT = 100;
   const READING_SIZE_MIN = 80;
@@ -320,9 +321,7 @@ body {
   function favoriteMarkup(html) {
     const template = doc.createElement('template');
     template.innerHTML = html;
-    template.content.querySelectorAll('iframe[srcdoc]').forEach(frame => {
-      replaceFavoriteFrame(frame, frame.getAttribute('srcdoc'));
-    });
+    recoverInlineFavoriteFrames(template.content);
     addPreviewSources(template.content);
     template.innerHTML = safeFavoriteHtml(template.innerHTML);
     return template;
@@ -335,11 +334,35 @@ body {
   }
 
   function sanitizeFavoriteFrame(source) {
+    if (/<iframe\b/i.test(source)) {
+      const parsed = new DOMParser().parseFromString(source, 'text/html');
+      recoverInlineFavoriteFrames(parsed);
+      source = parsed.documentElement.outerHTML;
+    }
     return parentWin.DOMPurify.sanitize(source, {
       WHOLE_DOCUMENT: true,
       FORCE_BODY: true,
       FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'link', 'meta', 'base', 'form'],
     });
+  }
+
+  function recoverInlineFavoriteFrames(root) {
+    for (const frame of root.querySelectorAll('iframe')) {
+      let source = frame.getAttribute('srcdoc');
+      if (source == null) {
+        const data = /^data:text\/html((?:;[^,]*)?),(.*)$/is.exec(frame.getAttribute('src') ?? '');
+        if (!data) continue;
+        try {
+          const payload = decodeURIComponent(data[2]);
+          source = /;base64$/i.test(data[1])
+            ? new TextDecoder().decode(Uint8Array.from(atob(payload), char => char.charCodeAt(0)))
+            : payload;
+        } catch {
+          continue;
+        }
+      }
+      replaceFavoriteFrame(frame, source);
+    }
   }
 
   function saveFrameSource(element, source) {
@@ -510,17 +533,38 @@ body {
     frame.setAttribute('sandbox', 'allow-same-origin');
     if (legacyReader) frame.setAttribute('data-th-reader-size-frame', '');
     frame.style.cssText = 'display:block;width:100%;border:0;height:1px;';
-    frameLoads.set(frame, new Promise(resolve => {
-      frame.addEventListener('load', async () => {
-        if (legacyReader) applyReaderSizeToFrame(frame);
+    const parsed = new Promise(resolve => {
+      const deadline = Date.now() + 5000;
+      function checkDocument() {
         const frameDoc = frame.contentDocument;
-        const nested = Array.from(frameDoc?.body?.querySelectorAll(FRAME_MARKER) ?? [], marker => mountFavoriteFrame(marker));
-        await Promise.all(nested.filter(Boolean).map(child => frameLoads.get(child)));
+        if (frameDoc?.URL === 'about:srcdoc' && frameDoc.body && frameDoc.readyState !== 'loading') {
+          resolve(frameDoc);
+        } else if (!frame.isConnected || Date.now() >= deadline) {
+          resolve(null);
+        } else {
+          setTimeout(checkDocument, 32);
+        }
+      }
+      setTimeout(checkDocument, 0);
+    });
+    frameLoads.set(frame, parsed.then(async frameDoc => {
+      if (!frameDoc) return;
+      if (legacyReader) applyReaderSizeToFrame(frame);
+      fitFavoriteFrame(frame);
+      frameDoc.addEventListener('toggle', () => refitFavoriteFrameAfterToggle(frame), true);
+      if (frameDoc.readyState === 'complete') {
         keepTransparentPreviewReadable(frame);
-        fitFavoriteFrame(frame);
-        frameDoc?.addEventListener('toggle', () => refitFavoriteFrameAfterToggle(frame), true);
-        resolve();
-      }, { once: true });
+      } else {
+        frame.addEventListener('load', () => {
+          keepTransparentPreviewReadable(frame);
+          refitFavoriteFrameAfterToggle(frame);
+        }, { once: true });
+      }
+      const nested = Array.from(frameDoc.body.querySelectorAll(FRAME_MARKER), marker => mountFavoriteFrame(marker));
+      if (nested.length) {
+        await Promise.all(nested.filter(Boolean).map(child => frameLoads.get(child)));
+        refitFavoriteFrameAfterToggle(frame);
+      }
     }));
     frame.srcdoc = '<!doctype html>' + sanitizeFavoriteFrame(source);
     container.replaceChildren(frame);
@@ -2639,6 +2683,78 @@ textarea[data-th-reading-font-css] {
     return escapeHtml(fav?.message ?? '').replace(/\r\n|\n|\r/g, '<br>');
   }
 
+  function hasRenderedFavoriteContent(root) {
+    const owner = root.ownerDocument;
+    const view = owner.defaultView;
+    if (!view) return false;
+    function visible(element) {
+      const visibility = view.getComputedStyle(element).visibility;
+      if (visibility === 'hidden' || visibility === 'collapse') return false;
+      for (let node = element; node && node !== root.parentElement; node = node.parentElement) {
+        const style = view.getComputedStyle(node);
+        if (style.display === 'none' || style.contentVisibility === 'hidden') return false;
+        if (Number(style.opacity) === 0 && !node.getAnimations().some(animation => animation.playState === 'running')) return false;
+      }
+      return true;
+    }
+
+    const range = owner.createRange();
+    const walker = owner.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let text;
+    while ((text = walker.nextNode())) {
+      const parent = text.parentElement;
+      if (!text.data.trim() || !parent || parent.closest('style, script, template')) continue;
+      range.selectNodeContents(text);
+      if (range.getClientRects().length && visible(parent)) return true;
+    }
+    const elements = [root, ...root.querySelectorAll('*')];
+    if (root === owner.body) elements.push(owner.documentElement);
+    for (const element of elements) {
+      if (element.matches('img') && !element.complete && (element.currentSrc || element.getAttribute('src')) && visible(element)) return true;
+      const bounds = element.getBoundingClientRect();
+      if (!bounds.width || !bounds.height || !visible(element)) continue;
+      if (element.matches('iframe')) {
+        if (element.contentDocument?.body && hasRenderedFavoriteContent(element.contentDocument.body)) return true;
+        continue;
+      }
+      if (element.matches('img')) {
+        if (element.naturalWidth) return true;
+        continue;
+      }
+      if (element.matches('svg,video,audio')) return true;
+      const style = view.getComputedStyle(element);
+      if (style.backgroundImage !== 'none'
+        || (element !== root && style.backgroundColor !== 'rgba(0, 0, 0, 0)')) return true;
+      for (const pseudo of ['::before', '::after']) {
+        const paint = view.getComputedStyle(element, pseudo);
+        if (!paint.content || paint.content === 'none' || paint.content === 'normal' || paint.display === 'none') continue;
+        if (!['""', "''"].includes(paint.content) || paint.backgroundImage !== 'none'
+          || paint.backgroundColor !== 'rgba(0, 0, 0, 0)') return true;
+      }
+    }
+    return false;
+  }
+
+  async function ensureVisibleFavoriteBody(message, fav) {
+    const frames = Array.from(message.querySelectorAll(`${FRAME_MARKER} > iframe`));
+    if (frames.length) {
+      const loading = doc.createElement('p');
+      loading.setAttribute('role', 'status');
+      loading.textContent = '正在载入收藏预览…';
+      message.prepend(loading);
+      await Promise.all(frames.map(frame => frameLoads.get(frame)));
+      loading.remove();
+    }
+    if (!message.isConnected || hasRenderedFavoriteContent(message)) return;
+
+    const savedText = [fav.editedMessage, fav.message, fav.originalMessage, fav.previewText]
+      .find(value => typeof value === 'string' && value.trim());
+    const textHtml = savedText ? `<div style="white-space:pre-wrap">${escapeHtml(savedText)}</div>` : '';
+    const images = buildImagesContainerHtml(fav.images);
+    const note = textHtml || images ? '美化预览暂不可用，已显示收藏中保留的内容。' : '这条收藏没有可显示的正文。可点「定位」查看原消息。';
+    message.innerHTML = `${textHtml}${images}<p><em>${note}</em></p>`;
+  }
+
   function buildEditableHtmlFromFavorite(fav) {
     if (fav?.messageHtml) return String(fav.messageHtml);
     if (fav?.editedMessageHtml) return String(fav.editedMessageHtml);
@@ -3661,7 +3777,6 @@ textarea[data-th-reading-font-css] {
     const replacements = [];
     const hiddenButtons = [];
     const frameSelector = `${FRAME_MARKER} > iframe`;
-    const topFrames = Array.from(content.querySelectorAll(frameSelector));
     const orderedFrames = [];
     let imageShadows = [];
     let savedPages = 0;
@@ -3683,6 +3798,8 @@ textarea[data-th-reading-font-css] {
         btn.style.display = 'none';
       });
 
+      await favoriteBodyLoads.get(body);
+      const topFrames = Array.from(content.querySelectorAll(frameSelector));
       await Promise.all(topFrames.map(frame => frameLoads.get(frame)));
       await readingFontTasks.get(body);
       function collectFrames(frames, offset = 0) {
@@ -3924,7 +4041,8 @@ textarea[data-th-reading-font-css] {
       </div>
     `;
 
-    renderFavoriteMarkup(modal.querySelector('.th-modal-message'), messageContent, `#${MODAL_ID} .th-modal-message`, fav);
+    const message = modal.querySelector('.th-modal-message');
+    renderFavoriteMarkup(message, messageContent, `#${MODAL_ID} .th-modal-message`, fav);
     attachReadingSize(modal);
     modal.querySelector('[data-th-reading-font]').addEventListener('click', () => void openReadingFontDialog());
 
@@ -3985,9 +4103,12 @@ textarea[data-th-reading-font-css] {
 
     modal.classList.add('th-modal-visible');
     state.modalVisible = true;
-    applyReadingFont(modal.querySelector('.th-modal-body'));
-
     processModalImages(modal, fav.images);
+    const body = modal.querySelector('.th-modal-body');
+    const bodyLoaded = ensureVisibleFavoriteBody(message, fav).then(() => {
+      if (body.isConnected && state.modalVisible) applyReadingFont(body);
+    });
+    favoriteBodyLoads.set(body, bodyLoaded);
   }
 
   function resolveMessageIdByPreview(chat, preview, originalFloor) {
@@ -4703,7 +4824,7 @@ textarea[data-th-reading-font-css] {
         switchMode('gallery');
         openPanel();
       },
-      version: '1.2.4',
+      version: '1.2.5',
     };
   }
 
