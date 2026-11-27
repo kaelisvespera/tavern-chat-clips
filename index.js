@@ -865,6 +865,8 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
 #${PANEL_ID} .th-chat-search-controls input {
   flex: 1;
+  min-width: 0;
+  box-sizing: border-box;
   background: var(--th-input-bg);
   border: 1px solid var(--th-input-border);
   border-radius: 8px;
@@ -4173,7 +4175,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
         switchMode('gallery');
         openPanel();
       },
-      version: '1.1.1',
+      version: '1.1.2',
     };
   }
 
