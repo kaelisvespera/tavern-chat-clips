@@ -3,6 +3,7 @@ import { css } from '/lib.js';
 import { download } from '/scripts/utils.js';
 import { createTavernChatHelper, installChatSearchEntrypoints } from './tt-entry.js';
 import { freezeRenderedAppearance } from './rendered-appearance.js';
+import { loadReadingFontFaces, parseReadingFontCss, selectReadingFontFaces } from './reading-font-css.js';
 import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
 (() => {
@@ -36,6 +37,17 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   const FRAME_MARKER = `[${FRAME_SOURCE}]`;
   const FROZEN_APPEARANCE = '[data-th-frozen-appearance]';
   const READER_SIZE_FRAME = '[data-th-reader-size-frame]';
+  const READING_FONT_STYLE_ID = 'th-chat-search-reader-font-faces';
+  const READING_FONT_KEY = 'th-chat-search-reading-font-css';
+  const DEFAULT_READING_FONT_CSS = `@import url("https://fontsapi.zeoseven.com/2/main/result.css");
+
+body {
+    font-family: "LXGW ZhenKai GB";
+    font-weight: normal;
+}`;
+  const READING_FONT_EXCLUDED = 'pre, code, kbd, samp, svg, math, style, script, .fa, .fa-solid, .fa-regular, .fa-brands';
+  const originalReadingFonts = new WeakMap();
+  const readingFontTasks = new WeakMap();
   const PANEL_HEIGHT_KEY = 'th-chat-search-panel-height';
   const PANEL_HEIGHT_MIN = 40;
   const PANEL_HEIGHT_DEFAULT = 100;
@@ -51,6 +63,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   const MAX_SCREENSHOT_HEIGHT_PX = 4096;
 
   let db = null;
+  let readingFont = null;
 
   function popupContent(message) {
     const content = doc.createElement('div');
@@ -83,6 +96,115 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       // Keep the default when browser preferences cannot be read.
     }
     return READING_SIZE_DEFAULT;
+  }
+
+  function getReadingFontCss() {
+    if (readingFont) return readingFont.source;
+    try {
+      return parentWin.localStorage.getItem(READING_FONT_KEY) ?? DEFAULT_READING_FONT_CSS;
+    } catch {
+      return DEFAULT_READING_FONT_CSS;
+    }
+  }
+
+  function setReadingFont(source) {
+    const parsed = parseReadingFontCss(source, css, doc);
+    if (source.trim() && !parsed.declarations.size) throw new Error('请在 body 中填写有效的字体声明。');
+    readingFont = {
+      source,
+      declarations: parsed.declarations,
+      faces: loadReadingFontFaces(parsed, css, {
+        baseUrl: doc.baseURI,
+        fetch: (url, options) => parentWin.fetch(url, { ...options, signal: AbortSignal.timeout(8000) }),
+      })
+        .catch(error => {
+          logger.warn('[ChatSearch] reading font stylesheet failed:', error);
+          return '';
+        }),
+    };
+    return readingFont;
+  }
+
+  function saveReadingFontCss(source) {
+    try {
+      setReadingFont(source.trim());
+    } catch {
+      return false;
+    }
+    try {
+      parentWin.localStorage.setItem(READING_FONT_KEY, readingFont.source);
+    } catch {
+      // The selected font still applies to this session.
+    }
+    const body = doc.querySelector(`#${MODAL_ID} .th-modal-body`);
+    if (body) applyReadingFont(body);
+    return true;
+  }
+
+  function updateReadingFontFaces(ownerDoc, faces) {
+    let style = ownerDoc.getElementById(READING_FONT_STYLE_ID);
+    if (!faces) {
+      style?.remove();
+      return;
+    }
+    if (!style) {
+      style = ownerDoc.createElement('style');
+      style.id = READING_FONT_STYLE_ID;
+      ownerDoc.head.appendChild(style);
+    }
+    if (style.textContent !== faces) style.textContent = faces;
+  }
+
+  function updateReadingFontDeclarations(root, declarations) {
+    for (const element of [root, ...root.querySelectorAll('*')]) {
+      if (!element.style || element.closest(READING_FONT_EXCLUDED)) continue;
+      const originals = originalReadingFonts.get(element);
+      if (originals) {
+        for (const [property, value, priority] of originals) element.style.setProperty(property, value, priority);
+        originalReadingFonts.delete(element);
+      }
+      if (!declarations.size) continue;
+      originalReadingFonts.set(element, Array.from(declarations.keys(), property => [
+        property, element.style.getPropertyValue(property), element.style.getPropertyPriority(property),
+      ]));
+      for (const [property, value] of declarations) element.style.setProperty(property, value, 'important');
+    }
+  }
+
+  function applyReadingFont(body) {
+    let preference = readingFont;
+    if (!preference) {
+      try {
+        preference = setReadingFont(getReadingFontCss());
+      } catch {
+        preference = setReadingFont(DEFAULT_READING_FONT_CSS);
+      }
+    }
+    const task = apply();
+    readingFontTasks.set(body, task);
+
+    async function apply() {
+      const frameSelector = `${FRAME_MARKER} > iframe`;
+      const frames = Array.from(body.querySelectorAll(frameSelector));
+      const [faces] = await Promise.all([preference.faces, ...frames.map(frame => frameLoads.get(frame))]);
+      if (!body.isConnected || readingFont !== preference) return;
+      for (const frame of frames) {
+        frames.push(...(frame.contentDocument?.querySelectorAll(frameSelector) ?? []));
+      }
+      const roots = [body, ...frames.map(frame => frame.contentDocument?.body).filter(Boolean)];
+      // The screenshot library embeds all registered subsets, so register only those this article uses.
+      const articleFaces = selectReadingFontFaces(faces, `${roots.map(root => root.textContent).join('')}{{user}}`, css);
+      for (const root of roots) {
+        updateReadingFontFaces(root.ownerDocument, articleFaces);
+        updateReadingFontDeclarations(root, preference.declarations);
+        root.getBoundingClientRect(); // Start loading the faces actually used by the article.
+      }
+      await Promise.all(roots.map(root => root.ownerDocument.fonts.ready));
+      if (!body.isConnected || readingFont !== preference) return;
+      const scrollTop = body.scrollTop;
+      for (const frame of frames.reverse()) fitFavoriteFrame(frame);
+      body.scrollTop = scrollTop;
+    }
   }
 
   function attachReadingSize(modal) {
@@ -118,6 +240,54 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     larger.addEventListener('click', () => changeSize(state.readingSize + READING_SIZE_STEP));
     reset.addEventListener('click', () => changeSize(READING_SIZE_DEFAULT));
     applySize();
+  }
+
+  async function openReadingFontDialog() {
+    const context = parentWin.SillyTavern.getContext();
+    const content = doc.createElement('div');
+    content.className = 'th-reading-font-dialog';
+    const label = doc.createElement('label');
+    label.textContent = '阅读字体 CSS';
+    const description = doc.createElement('p');
+    description.textContent = '可用 @import 加载字体，用 body 的 font-family 和 font-weight 设置阅读字体。阅读和截图使用同一字体，清空后点应用可恢复原字体。';
+    const error = doc.createElement('p');
+    error.className = 'th-reading-font-error';
+    error.setAttribute('role', 'alert');
+    error.hidden = true;
+    error.textContent = '字体 CSS 未应用，请检查写法或字体链接后重试。';
+    content.append(label, description, error);
+
+    await context.callGenericPopup(content, context.POPUP_TYPE.INPUT, getReadingFontCss(), {
+      label,
+      inputLabel: label,
+      inputDescription: description,
+      rows: 7,
+      placeholder: 'body {\n  font-family: "你的字体", serif;\n  font-weight: 400;\n}',
+      okButton: '应用',
+      cancelButton: '取消',
+      wider: true,
+      leftAlign: true,
+      allowVerticalScrolling: true,
+      onOpen(popup) {
+        const textarea = popup.mainInput;
+        textarea.id ||= `th-reading-font-css-${popup.id}`;
+        label.htmlFor = textarea.id;
+        textarea.setAttribute('data-th-reading-font-css', '');
+        textarea.spellcheck = false;
+        textarea.addEventListener('input', () => {
+          error.hidden = true;
+          textarea.removeAttribute('aria-invalid');
+        });
+      },
+      async onClosing(popup) {
+        if (popup.result !== context.POPUP_RESULT.AFFIRMATIVE) return true;
+        if (await saveReadingFontCss(popup.mainInput.value)) return true;
+        error.hidden = false;
+        popup.mainInput.setAttribute('aria-invalid', 'true');
+        popup.mainInput.focus();
+        return false;
+      },
+    });
   }
 
   function scopeFavoriteCss(source, scope) {
@@ -282,6 +452,21 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     frame.style.height = `${root.scrollHeight}px`;
   }
 
+  function refitFavoriteFrameAfterToggle(frame) {
+    const frames = [frame];
+    let parentFrame = frame.ownerDocument.defaultView?.frameElement;
+    while (parentFrame && frameLoads.has(parentFrame)) {
+      frames.push(parentFrame);
+      parentFrame = parentFrame.ownerDocument.defaultView?.frameElement;
+    }
+
+    const scroller = frames.at(-1).closest('.th-modal-body, .th-fav-editor-body');
+    const scrollTop = scroller?.scrollTop;
+    frames.forEach(fitFavoriteFrame);
+    // Measuring a 1px frame can temporarily clamp the outer scroll position.
+    if (scroller) scroller.scrollTop = scrollTop;
+  }
+
   function colorLuminance(value) {
     const rgb = /^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/i.exec(value);
     const hex = /^#([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(value);
@@ -333,7 +518,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
         await Promise.all(nested.filter(Boolean).map(child => frameLoads.get(child)));
         keepTransparentPreviewReadable(frame);
         fitFavoriteFrame(frame);
-        frameDoc?.addEventListener('toggle', () => fitFavoriteFrame(frame), true);
+        frameDoc?.addEventListener('toggle', () => refitFavoriteFrameAfterToggle(frame), true);
         resolve();
       }, { once: true });
     }));
@@ -346,6 +531,10 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     const computed = parentWin.getComputedStyle(target);
     const style = doc.createElement('div').style;
     style.margin = '0';
+    style.overflowX = 'hidden';
+    style.overflowWrap = 'anywhere';
+    // TT's dialogue markup already contains the literal quotation marks.
+    style.quotes = 'none';
     style.fontFamily = computed.fontFamily;
     style.fontSize = `calc(${computed.fontSize} * var(--th-reading-scale, 1))`;
     style.color = computed.color;
@@ -354,7 +543,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
     const marker = doc.createElement('div');
     const messageId = Number.isInteger(favorite.messageId) ? favorite.messageId : '';
-    const html = `<html><head>${styles.map(node => node.outerHTML).join('')}</head><body style="${escapeHtml(style.cssText)}"><div id="chat"><div class="mes" mesid="${messageId}"><div class="mes_block"><div class="mes_text">${template.innerHTML}</div></div></div></div></body></html>`;
+    const html = `<html><head><style>.mes_text pre{max-inline-size:100%;overflow-x:auto}</style>${styles.map(node => node.outerHTML).join('')}</head><body style="${escapeHtml(style.cssText)}"><div id="chat"><div class="mes" mesid="${messageId}"><div class="mes_block"><div class="mes_text">${template.innerHTML}</div></div></div></div></body></html>`;
     saveFrameSource(marker, html);
     target.replaceChildren(marker);
     mountFavoriteFrame(marker, true);
@@ -896,6 +1085,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
     const style = doc.getElementById(STYLE_ID);
     if (style) style.remove();
+    doc.getElementById(READING_FONT_STYLE_ID)?.remove();
 
     if (state.keydownHandler) {
       doc.removeEventListener('keydown', state.keydownHandler, true);
@@ -1505,6 +1695,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 }
 
 .th-modal-font-controls,
+.th-modal-size-controls,
 .th-modal-toolbar-actions {
   display: flex;
   align-items: center;
@@ -1561,6 +1752,34 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   min-width: 52px;
   font-size: 13px;
   font-variant-numeric: tabular-nums;
+}
+
+.th-modal-toolbar [data-th-reading-font] {
+  font-size: 13px;
+}
+
+.th-reading-font-dialog label {
+  font-weight: 600;
+}
+
+.th-reading-font-dialog p {
+  margin: 8px 0 0;
+  font-size: 0.9em;
+  overflow-wrap: anywhere;
+}
+
+.th-reading-font-error {
+  color: var(--SmartThemeQuoteColor, currentColor);
+}
+
+textarea[data-th-reading-font-css] {
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+  resize: vertical;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 14px;
+  line-height: 1.45;
 }
 
 .th-modal-toolbar .th-modal-close {
@@ -1625,7 +1844,9 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 .th-modal-body {
   min-height: 0;
   padding: 24px 64px 56px;
+  overflow-x: hidden;
   overflow-y: auto;
+  overscroll-behavior-x: contain;
   text-align: center;
   /* Hide scrollbar while keeping content scrollable */
   -ms-overflow-style: none; /* IE, Edge */
@@ -1719,12 +1940,18 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   margin: 0 auto 40px;
   text-align: left;
   max-width: 90%;
+  overflow-wrap: anywhere;
   opacity: 0.92;
   quotes: none;
 }
 
 .th-modal-message * {
   quotes: none;
+}
+
+.th-modal-message pre {
+  max-inline-size: 100%;
+  overflow-x: auto;
 }
 
 .th-modal-message .mes-code-preview-toggle,
@@ -3457,6 +3684,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       });
 
       await Promise.all(topFrames.map(frame => frameLoads.get(frame)));
+      await readingFontTasks.get(body);
       function collectFrames(frames, offset = 0) {
         for (const frame of frames) {
           orderedFrames.push({ frame, offset });
@@ -3531,17 +3759,23 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       if (pages.length > 1) notifier?.info?.(`正在分成 ${pages.length} 张 PNG 导出。`);
 
       for (const [index, page] of pages.entries()) {
-        const options = { quality: 0.8, backgroundColor: opaqueBg, scale };
+        const options = { quality: 0.8, backgroundColor: opaqueBg, scale,
+          onCreateForeignObjectSvg(svg) {
+            // modern-screenshot quotes generated content, even when it is a CSS quote keyword.
+            const style = svg.querySelector('style');
+            if (style) style.textContent = style.textContent.replace(
+              /(content:\s*)'((?:no-)?(?:open|close)-quote)'(?=;)/g, '$1$2');
+            if (pages.length > 1) {
+              const foreignObject = svg.querySelector('foreignObject');
+              foreignObject.setAttribute('height', String(height));
+              foreignObject.setAttribute('y', String(-page.top));
+            }
+          },
+        };
         if (pages.length > 1) {
           options.width = width;
           options.height = page.height;
           options.onCloneNode = clone => clone.style.setProperty('height', `${height}px`, 'important');
-          options.onCreateForeignObjectSvg = svg => {
-            // Draw this page directly at full resolution over the full layout.
-            const foreignObject = svg.querySelector('foreignObject');
-            foreignObject.setAttribute('height', String(height));
-            foreignObject.setAttribute('y', String(-page.top));
-          };
         }
         const image = await screenshotLib.domToPng(content, options);
         const blob = await (await parentWin.fetch(image)).blob();
@@ -3654,11 +3888,14 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       <div class="th-modal-backdrop"></div>
       <div class="th-modal-content">
         <div class="th-modal-toolbar">
-          <div class="th-modal-font-controls" role="group" aria-label="阅读字号">
-            <span class="th-modal-font-label" aria-hidden="true">字号</span>
-            <button type="button" data-th-reading-step="-1" aria-label="缩小字号" title="缩小字号">−</button>
-            <button type="button" data-th-reading-reset aria-label="当前字号 100%，恢复默认字号" title="恢复默认字号">100%</button>
-            <button type="button" data-th-reading-step="1" aria-label="放大字号" title="放大字号">+</button>
+          <div class="th-modal-font-controls">
+            <div class="th-modal-size-controls" role="group" aria-label="阅读字号">
+              <span class="th-modal-font-label" aria-hidden="true">字号</span>
+              <button type="button" data-th-reading-step="-1" aria-label="缩小字号" title="缩小字号">−</button>
+              <button type="button" data-th-reading-reset aria-label="当前字号 100%，恢复默认字号" title="恢复默认字号">100%</button>
+              <button type="button" data-th-reading-step="1" aria-label="放大字号" title="放大字号">+</button>
+            </div>
+            <button type="button" data-th-reading-font aria-label="阅读字体" title="阅读字体">字体</button>
           </div>
           <div class="th-modal-toolbar-actions" role="group" aria-label="收藏阅读操作">
             <button type="button" class="th-modal-load" aria-label="定位到原消息" title="定位到原消息">
@@ -3689,6 +3926,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
     renderFavoriteMarkup(modal.querySelector('.th-modal-message'), messageContent, `#${MODAL_ID} .th-modal-message`, fav);
     attachReadingSize(modal);
+    modal.querySelector('[data-th-reading-font]').addEventListener('click', () => void openReadingFontDialog());
 
     const closeBtn = modal.querySelector('.th-modal-close');
     const exportBtn = modal.querySelector('.th-modal-export');
@@ -3747,6 +3985,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
     modal.classList.add('th-modal-visible');
     state.modalVisible = true;
+    applyReadingFont(modal.querySelector('.th-modal-body'));
 
     processModalImages(modal, fav.images);
   }
@@ -4464,7 +4703,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
         switchMode('gallery');
         openPanel();
       },
-      version: '1.2.3',
+      version: '1.2.4',
     };
   }
 
