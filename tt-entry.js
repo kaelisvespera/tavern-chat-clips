@@ -79,7 +79,20 @@ export function installChatSearchEntrypoints(doc, open) {
     quickRow.append(quickButton);
     sendForm?.append(quickRow);
 
+    // QR助手 manages visibility of registered rows and invokes them with .click().
+    const qrEntry = { dom_id: quickRow.id, group_name: '聊天记录管理', button_name: label };
+    const view = doc.defaultView;
+    const qrRegistry = sendForm && view ? (view.qrAssistantExtensionApi ??= []) : null;
+    if (Array.isArray(qrRegistry)) qrRegistry.push(qrEntry);
+    quickRow.addEventListener('click', event => {
+        if (event.target === quickRow && !event.isTrusted) openPanel();
+    });
+
     return () => {
+        if (Array.isArray(qrRegistry)) {
+            const index = qrRegistry.indexOf(qrEntry);
+            if (index >= 0) qrRegistry.splice(index, 1);
+        }
         menuButton.remove();
         quickRow.remove();
     };

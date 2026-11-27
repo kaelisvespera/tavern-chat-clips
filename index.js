@@ -1,4 +1,5 @@
 // 原脚本：千秋梦。经授权移植到 TauriTavern。
+import { css } from '/lib.js';
 import { createTavernChatHelper, installChatSearchEntrypoints } from './tt-entry.js';
 import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
@@ -52,7 +53,63 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   }
 
   function safeFavoriteHtml(html) {
-    return parentWin.DOMPurify.sanitize(html);
+    return parentWin.DOMPurify.sanitize(html, { FORCE_BODY: true });
+  }
+
+  function scopeFavoriteCss(source, scope) {
+    const ast = css.parse(source, { silent: true });
+
+    function scopedRules(rules) {
+      return rules.filter(rule => {
+        if (rule.type === 'media' || rule.type === 'supports') {
+          rule.rules = scopedRules(rule.rules);
+          return rule.rules.length > 0;
+        }
+        if (rule.type !== 'rule') return false;
+
+        rule.selectors = rule.selectors.flatMap(selector => {
+          // TT already prefixes rendered regex rules with the chat-only selector.
+          const relative = selector.trim()
+            .replace(/^\.mes_text(?:\s+|$)/, '')
+            .replace(/^(?:(?:html|body|:root)(?:\s+|$))+/, '');
+          if (/^[+~]/.test(relative)) return [];
+          return [relative ? `${scope} ${relative}` : scope];
+        });
+        return rule.selectors.length > 0;
+      });
+    }
+
+    ast.stylesheet.rules = scopedRules(ast.stylesheet.rules);
+    return css.stringify(ast);
+  }
+
+  function favoriteMarkup(html) {
+    const template = doc.createElement('template');
+    template.innerHTML = safeFavoriteHtml(html);
+    return template;
+  }
+
+  function takeFavoriteStyles(template) {
+    const styles = Array.from(template.content.querySelectorAll('style'));
+    styles.forEach(style => style.remove());
+    return styles;
+  }
+
+  function renderFavoriteMarkup(target, html, scope) {
+    const template = favoriteMarkup(html);
+    const styles = takeFavoriteStyles(template);
+    for (const original of styles) {
+      try {
+        const scoped = doc.createElement('style');
+        scoped.media = original.media;
+        scoped.textContent = scopeFavoriteCss(original.textContent, scope);
+        if (scoped.textContent) target.before(scoped);
+      } catch (error) {
+        logger.warn('[ChatSearch] favorite stylesheet skipped:', error);
+      }
+    }
+    target.replaceChildren(template.content);
+    return styles.map(style => style.outerHTML).join('');
   }
 
   const FAVORITE_PAYLOAD_FIELDS = [
@@ -2148,6 +2205,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       const renderedContent = getRenderedMessageContent(fav.messageId);
       currentHtml = renderedContent ? String(renderedContent) : '';
     }
+    currentHtml = restoreFavoriteStyles(fav, currentHtml);
     const titleValue = String(fav.title ?? '');
     const subtitleValue = String(fav.subtitle ?? '');
 
@@ -2199,8 +2257,9 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     closeBtn.addEventListener('click', close);
     cancelBtn.addEventListener('click', close);
 
+    let originalStyles = '';
     if (richInput) {
-      richInput.innerHTML = safeFavoriteHtml(currentHtml);
+      originalStyles = renderFavoriteMarkup(richInput, currentHtml, `#${EDITOR_ID} .th-fav-editor-rich`);
       richInput.querySelectorAll('img').forEach(img => {
         img.setAttribute('contenteditable', 'false');
         img.setAttribute('draggable', 'false');
@@ -2216,7 +2275,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       fav.subtitle = newSubtitle;
       fav.updatedAt = Date.now();
 
-      fav.messageHtml = newHtml;
+      fav.messageHtml = safeFavoriteHtml(originalStyles + newHtml);
       fav.message = collapseWhitespace(stripTags(newHtml));
       delete fav.editedMessage;
       delete fav.editedMessageHtml;
@@ -2672,7 +2731,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   }
 
   function stripTags(value) {
-    return String(value ?? '').replace(/<[^>]+>/g, ' ');
+    return String(value ?? '').replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, ' ').replace(/<[^>]+>/g, ' ');
   }
 
   function collapseWhitespace(value) {
@@ -2972,9 +3031,13 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       const snapshot = mesText.cloneNode(true);
       const frames = Array.from(mesText.querySelectorAll('iframe'));
       snapshot.querySelectorAll('iframe').forEach((frame, index) => {
-        const body = frames[index].contentDocument?.body;
-        if (body) frame.replaceWith(...Array.from(body.childNodes, node => doc.importNode(node, true)));
-        else frame.remove();
+        const frameDoc = frames[index].contentDocument;
+        if (!frameDoc?.body) {
+          frame.remove();
+          return;
+        }
+        const nodes = [...frameDoc.querySelectorAll('head style'), ...frameDoc.body.childNodes];
+        frame.replaceWith(...nodes.map(node => doc.importNode(node, true)));
       });
 
       const media = Array.from(mesElement.querySelectorAll('.mes_img_container'))
@@ -2987,6 +3050,17 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     } catch {
       return null;
     }
+  }
+
+  function restoreFavoriteStyles(fav, html) {
+    // Recover styles lost by 1.1.0 only when the live and archived bodies still match.
+    if (!html || /<style[\s>]/i.test(html) || !isFavoriteChat(fav)) return html;
+    const live = getRenderedMessageContent(fav.messageId);
+    if (!live || !/<style[\s>]/i.test(live)) return html;
+    const liveMarkup = favoriteMarkup(live);
+    const styles = takeFavoriteStyles(liveMarkup);
+    if (liveMarkup.innerHTML.trim() !== favoriteMarkup(html).innerHTML.trim()) return html;
+    return styles.map(style => style.outerHTML).join('') + html;
   }
 
   function processModalImages(modalElement, imagesData) {
@@ -3044,7 +3118,6 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     const originalContentHeight = content.style.height;
 
     const replacements = [];
-    const quoteReplacements = [];
     const hiddenButtons = [];
     let imageShadows = [];
 
@@ -3074,23 +3147,13 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
         const walker = doc.createTreeWalker(body, NodeFilter.SHOW_TEXT);
         let node;
         while ((node = walker.nextNode())) {
+          if (node.parentElement?.closest('style')) continue;
           if (node.nodeValue && node.nodeValue.includes(userName)) {
             replacements.push({ node, original: node.nodeValue });
             node.nodeValue = node.nodeValue.replace(new RegExp(escapeRegExp(userName), 'g'), '{{user}}');
           }
         }
       }
-
-      // 暂时将 <q> 标签替换为普通 <span>，避免截图时出现 open-quote/close-quote 文本
-      body.querySelectorAll('q').forEach(qEl => {
-        const parent = qEl.parentNode;
-        if (!parent) return;
-        const span = doc.createElement('span');
-        span.textContent = qEl.textContent;
-        span.style.fontStyle = 'italic';
-        quoteReplacements.push({ parent, original: qEl, replacement: span, nextSibling: qEl.nextSibling });
-        parent.replaceChild(span, qEl);
-      });
 
       // 展开内容以进行长截图
       body.style.overflow = 'visible';
@@ -3145,20 +3208,6 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       // 恢复用户名
       replacements.forEach(({ node, original }) => {
         node.nodeValue = original;
-      });
-
-      // 恢复 <q> 标签
-      quoteReplacements.forEach(({ parent, original, replacement, nextSibling }) => {
-        if (!parent) return;
-        if (replacement.parentNode === parent) {
-          parent.replaceChild(original, replacement);
-        } else if (replacement.parentNode) {
-          replacement.parentNode.replaceChild(original, replacement);
-        } else if (nextSibling && nextSibling.parentNode === parent) {
-          parent.insertBefore(original, nextSibling);
-        } else {
-          parent.appendChild(original);
-        }
       });
 
       body.style.overflow = originalBodyOverflow;
@@ -3257,7 +3306,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
         <div class="th-modal-body">
           <h2 class="th-modal-title">${escapeHtml(fav.title)}</h2>
           ${subtitleHtml}
-          <div class="th-modal-message">${safeFavoriteHtml(messageContent)}</div>
+          <div class="th-modal-message"></div>
           <div class="th-modal-meta">
             <div class="th-modal-source">${escapeHtml(fav.charName || '未知')} 来信</div>
             <div class="th-modal-time">${timestamp}</div>
@@ -3265,6 +3314,8 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
         </div>
       </div>
     `;
+
+    renderFavoriteMarkup(modal.querySelector('.th-modal-message'), restoreFavoriteStyles(fav, messageContent), `#${MODAL_ID} .th-modal-message`);
 
     const closeBtn = modal.querySelector('.th-modal-close');
     const exportBtn = modal.querySelector('.th-modal-export');
@@ -4122,7 +4173,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
         switchMode('gallery');
         openPanel();
       },
-      version: '1.1.0',
+      version: '1.1.1',
     };
   }
 
