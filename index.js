@@ -22,7 +22,6 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   const EMPTY_ID = 'th-chat-search-empty';
   const MODAL_ID = 'th-reading-modal';
   const EDITOR_ID = 'th-favorite-editor';
-  const MAX_RESULTS = 200;
   const DB_NAME = 'th-chat-favorites';
   const DB_VERSION = 3;
   const STORE_NAME = 'favorites';
@@ -30,6 +29,9 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   const PREVIEW_TEXT_MAX_LEN = 500;
   const MESSAGE_FAVORITE_BUTTON_CLASS = 'th-chat-search-mes-favorite';
   const PURGE_DELETED_PAYLOAD_FLAG = 'th-chat-search-purge-deleted-payload-v1';
+  const FRAME_SOURCE = 'data-th-favorite-frame';
+  const FRAME_MARKER = `[${FRAME_SOURCE}]`;
+  const frameLoads = new WeakMap();
 
   let db = null;
 
@@ -95,6 +97,79 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     return styles;
   }
 
+  function sanitizeFavoriteFrame(source) {
+    return parentWin.DOMPurify.sanitize(source, {
+      WHOLE_DOCUMENT: true,
+      FORCE_BODY: true,
+      FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'link', 'meta', 'base', 'form'],
+    });
+  }
+
+  function saveFrameSource(element, source) {
+    if (!source) {
+      element.remove();
+      return;
+    }
+    element.setAttribute(FRAME_SOURCE, encodeURIComponent(sanitizeFavoriteFrame(source)));
+  }
+
+  function fitFavoriteFrame(frame) {
+    const root = frame.contentDocument?.documentElement;
+    if (!root) return;
+    frame.style.height = '1px';
+    frame.style.height = `${root.scrollHeight}px`;
+  }
+
+  function colorLuminance(value) {
+    const rgb = /^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/i.exec(value);
+    const hex = /^#([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(value);
+    if (!rgb && !hex) return null;
+    const channels = (rgb ? rgb.slice(1).map(Number) : hex.slice(1).map(part => parseInt(part, 16)))
+      .map(channel => channel / 255)
+      .map(channel => channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4);
+    return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+  }
+
+  function keepTransparentPreviewReadable(frame) {
+    const view = frame.contentWindow;
+    const frameDoc = frame.contentDocument;
+    if (!view || !frameDoc?.body) return;
+    const root = view.getComputedStyle(frameDoc.documentElement);
+    const body = view.getComputedStyle(frameDoc.body);
+    const transparent = style => style.backgroundColor === 'rgba(0, 0, 0, 0)' && style.backgroundImage === 'none';
+    if (!transparent(root) || !transparent(body)) return;
+
+    const foreground = colorLuminance(body.color);
+    if (foreground == null) return;
+    const host = parentWin.getComputedStyle(doc.body).getPropertyValue('--SmartThemeBlurTintColor').trim();
+    const backdrop = colorLuminance(host) ?? colorLuminance('rgb(18, 19, 27)');
+    const contrast = (Math.max(foreground, backdrop) + 0.05) / (Math.min(foreground, backdrop) + 0.05);
+    if (contrast < 4.5) frameDoc.body.style.backgroundColor = foreground <= 0.179 ? '#fff' : '#000';
+  }
+
+  function mountFavoriteFrame(container) {
+    let source;
+    try {
+      source = decodeURIComponent(container.getAttribute(FRAME_SOURCE));
+    } catch {
+      return;
+    }
+    const frame = doc.createElement('iframe');
+    frame.title = '收藏的前端预览';
+    frame.setAttribute('sandbox', 'allow-same-origin');
+    frame.style.cssText = 'display:block;width:100%;border:0;height:1px;';
+    frameLoads.set(frame, new Promise(resolve => {
+      frame.addEventListener('load', () => {
+        keepTransparentPreviewReadable(frame);
+        fitFavoriteFrame(frame);
+        frame.contentDocument?.addEventListener('toggle', () => fitFavoriteFrame(frame), true);
+        resolve();
+      }, { once: true });
+    }));
+    frame.srcdoc = '<!doctype html>' + sanitizeFavoriteFrame(source);
+    container.replaceChildren(frame);
+  }
+
   function renderFavoriteMarkup(target, html, scope) {
     const template = favoriteMarkup(html);
     const styles = takeFavoriteStyles(template);
@@ -109,6 +184,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       }
     }
     target.replaceChildren(template.content);
+    target.querySelectorAll(FRAME_MARKER).forEach(mountFavoriteFrame);
     return styles.map(style => style.outerHTML).join('');
   }
 
@@ -591,9 +667,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
   const state = {
     helper: null,
-    keywords: [],
-    matches: [],
-    fullMatchCount: 0,
+    searchRequest: 0,
     highlightedElement: null,
     highlightTimer: null,
     keydownHandler: null,
@@ -949,11 +1023,6 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   border-color: var(--th-accent-color);
   background: color-mix(in srgb, var(--th-accent-color) 8%, transparent);
 }
-#${PANEL_ID} .th-chat-search-result.th-selected {
-  border-color: var(--th-accent-color);
-  background: color-mix(in srgb, var(--th-accent-color) 18%, transparent);
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--th-accent-color) 40%, transparent);
-}
 #${PANEL_ID} .th-chat-search-result-header {
   display: flex;
   flex-wrap: wrap;
@@ -994,46 +1063,15 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   flex: 1 1 0;
 }
 
-#${PANEL_ID} .th-match-nav {
-  display: none;
-  align-items: center;
-  justify-content: center;
-  gap: 12px;
-  font-size: 0.86em;
-  opacity: 0.75;
-  margin-top: 8px;
-  margin-bottom: 4px;
+#${PANEL_ID} .th-favorite-search-group {
+  display: grid;
+  gap: 8px;
 }
-#${PANEL_ID} .th-match-nav.th-visible {
-  display: flex;
-}
-#${PANEL_ID} .th-match-nav-btn {
-  background: var(--th-inline-bg);
-  border: 1px solid color-mix(in srgb, var(--th-accent-color) 30%, transparent);
-  border-radius: 4px;
-  padding: 2px 6px;
-  cursor: pointer;
-  font-size: 0.79em;
-  opacity: 0.7;
-  transition: opacity 0.18s ease;
-}
-#${PANEL_ID} .th-match-nav-btn:hover {
-  opacity: 1;
-}
-#${PANEL_ID} .th-match-nav-btn:disabled {
-  opacity: 0.3;
-  cursor: not-allowed;
-}
-
-#${PANEL_ID} .th-chat-search-result-snippet {
-  font-size: 0.93em;
-  line-height: 1.5;
-  opacity: 0.85;
-  margin-top: 6px;
-  display: none;
-}
-#${PANEL_ID} .th-chat-search-result-snippet.th-expanded {
-  display: block;
+#${PANEL_ID} .th-favorite-search-group h3 {
+  margin: 0;
+  font-size: 1em;
+  font-weight: 600;
+  overflow-wrap: anywhere;
 }
 
 #${EMPTY_ID} {
@@ -1417,6 +1455,11 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
 .th-modal-message * {
   quotes: none;
+}
+
+.th-modal-message .mes-code-preview-toggle,
+#${EDITOR_ID} .th-fav-editor-rich .mes-code-preview-toggle {
+  display: none;
 }
 
 .th-modal-message q::before,
@@ -2186,7 +2229,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     return escapeHtml(fallback).replace(/\r\n|\n|\r/g, '<br>');
   }
 
-  async function openFavoriteEditor(fav) {
+  async function openFavoriteEditor(fav, readingList) {
     if (!fav) return;
 
     try {
@@ -2207,7 +2250,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       const renderedContent = getRenderedMessageContent(fav.messageId);
       currentHtml = renderedContent ? String(renderedContent) : '';
     }
-    currentHtml = restoreFavoriteStyles(fav, currentHtml);
+    currentHtml = restoreFavoritePresentation(fav, currentHtml);
     const titleValue = String(fav.title ?? '');
     const subtitleValue = String(fav.subtitle ?? '');
 
@@ -2288,7 +2331,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       await updateFavoriteDB(fav);
       await reloadFavorites();
       close();
-      if (state.modalVisible) void openReadingModal(fav);
+      if (state.modalVisible) void openReadingModal(fav, readingList);
     });
 
     setTimeout(() => {
@@ -2626,7 +2669,8 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     const input = doc.createElement('input');
     input.id = INPUT_ID;
     input.type = 'text';
-    input.placeholder = '输入关键词';
+    input.placeholder = '搜索收藏标题或金句';
+    input.setAttribute('aria-label', '搜索所有收藏的标题和金句');
     controls.appendChild(input);
 
     const searchBtn = createIconButton('fa-magnifying-glass', '搜索');
@@ -2740,84 +2784,6 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     return value.replace(/\s+/g, ' ').trim();
   }
 
-  function findAllMatches(text, keywords) {
-    if (!keywords.length) return [];
-    const plain = collapseWhitespace(stripTags(text));
-    const lower = plain.toLowerCase();
-    const matches = [];
-
-    keywords.forEach(term => {
-      if (!term) return;
-      let pos = 0;
-      while ((pos = lower.indexOf(term, pos)) !== -1) {
-        matches.push({ pos, term });
-        pos += term.length;
-      }
-    });
-
-    return matches.sort((a, b) => a.pos - b.pos);
-  }
-
-  function groupMatches(matches) {
-    if (!matches.length) return [];
-    const groups = [];
-    let currentGroup = [matches[0]];
-
-    for (let i = 1; i < matches.length; i++) {
-      const groupSpan = matches[i].pos - currentGroup[0].pos;
-      const lastDistance = matches[i].pos - currentGroup[currentGroup.length - 1].pos;
-
-      if (lastDistance <= 100 && groupSpan <= 300) {
-        currentGroup.push(matches[i]);
-      } else {
-        groups.push(currentGroup);
-        currentGroup = [matches[i]];
-      }
-    }
-    groups.push(currentGroup);
-    return groups;
-  }
-
-  function buildSnippet(text, keywords, matchIndex = 0) {
-    const plain = collapseWhitespace(stripTags(text));
-    if (!plain) return '<em>(空消息)</em>';
-
-    if (!keywords.length) {
-      const short = plain.slice(0, 200);
-      return escapeHtml(short) + (plain.length > 200 ? ' …' : '');
-    }
-
-    const matches = findAllMatches(text, keywords);
-    if (!matches.length) {
-      const short = plain.slice(0, 200);
-      return escapeHtml(short) + (plain.length > 200 ? ' …' : '');
-    }
-
-    const groups = groupMatches(matches);
-    const group = groups[Math.min(matchIndex, groups.length - 1)];
-    const firstMatch = group[0];
-    const lastMatch = group[group.length - 1];
-
-    const start = Math.max(0, firstMatch.pos - 35);
-    const end = Math.min(plain.length, lastMatch.pos + lastMatch.term.length + 85);
-
-    const snippet = plain.slice(start, end);
-    const prefix = start > 0 ? '… ' : '';
-    const suffix = end < plain.length ? ' …' : '';
-    const escaped = escapeHtml(snippet);
-    const pattern = new RegExp(keywords.filter(Boolean).map(escapeRegExp).join('|'), 'gi');
-    return prefix + escaped.replace(pattern, m => `<mark>${m}</mark>`) + suffix;
-  }
-
-  function markSelectedRow(messageId) {
-    if (!elements) return;
-    const rows = elements.results.querySelectorAll('.th-chat-search-result');
-    rows.forEach(row => {
-      const currentId = Number(row.dataset.messageId);
-      row.classList.toggle('th-selected', messageId != null && currentId === messageId);
-    });
-  }
-
   function getChatContainer() {
     return doc.querySelector('#chat') || doc.querySelector('#chatHistory') || doc.querySelector('.chat') || doc.body;
   }
@@ -2850,7 +2816,9 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     const chatId = context?.getCurrentChatId?.() ?? 'unknown';
     const groupId = context?.groupId ?? null;
     const characterId = context?.characterId ?? 'unknown';
-    const characterAvatar = context?.characters?.[context?.characterId]?.avatar || 'unknown';
+    const character = groupId ? null : context?.characters?.[context?.characterId];
+    const characterAvatar = character?.avatar || 'unknown';
+    const characterName = character?.name || message.name || '未知';
     const chatName = context?.chatMetadata?.name || context?.name2 || '未知聊天';
     const renderedContent = getRenderedMessageContent(messageId);
     const imgSelector = `#chat .mes[mesid="${messageId}"] .mes_img_container img`;
@@ -2874,6 +2842,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       groupId: groupId,
       characterId: characterId,
       characterAvatar: characterAvatar,
+      characterName: characterName,
       title: title.trim() || `消息 #${messageId}`,
       subtitle: subtitle.trim() || '',
       message: message.message,
@@ -3033,20 +3002,28 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       const snapshot = mesText.cloneNode(true);
       const frames = Array.from(mesText.querySelectorAll('iframe'));
       snapshot.querySelectorAll('iframe').forEach((frame, index) => {
-        const frameDoc = frames[index].contentDocument;
-        if (!frameDoc?.body) {
-          frame.remove();
-          return;
-        }
-        const nodes = [...frameDoc.querySelectorAll('head style'), ...frameDoc.body.childNodes];
-        frame.replaceWith(...nodes.map(node => doc.importNode(node, true)));
+        const currentFrame = frames[index];
+        const frameDoc = currentFrame.contentDocument;
+        const rendered = frameDoc?.documentElement?.outerHTML;
+        const source = frameDoc?.body?.hasChildNodes() ? rendered : currentFrame.srcdoc || rendered;
+        const placeholder = doc.createElement('div');
+        frame.replaceWith(placeholder);
+        saveFrameSource(placeholder, source);
+      });
+      // TT can move the preview out of the source floor. Its hidden code block stays there.
+      snapshot.querySelectorAll('.mes-code-preview-placeholder').forEach(placeholder => {
+        const code = placeholder.nextElementSibling;
+        if (!code?.matches('pre[hidden]')) return;
+        saveFrameSource(placeholder, code.querySelector('code')?.textContent);
+        placeholder.hidden = false;
       });
 
       const media = Array.from(mesElement.querySelectorAll('.mes_img_container'))
         .filter(container => !mesText.contains(container))
         .map(container => container.outerHTML).join('');
       const content = safeFavoriteHtml(snapshot.innerHTML + media);
-      if (frames.length && !snapshot.textContent.trim() && !snapshot.querySelector('img, video, audio') && !media) return null;
+      if (frames.length && !snapshot.textContent.trim()
+        && !snapshot.querySelector(`img, video, audio, ${FRAME_MARKER}`) && !media) return null;
 
       return content;
     } catch {
@@ -3054,14 +3031,38 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     }
   }
 
-  function restoreFavoriteStyles(fav, html) {
-    // Recover styles lost by 1.1.0 only when the live and archived bodies still match.
-    if (!html || /<style[\s>]/i.test(html) || !isFavoriteChat(fav)) return html;
+  function restoreFavoritePresentation(fav, html) {
+    // Recover presentation lost by older versions without replacing edited snapshots.
+    if (!html || !isFavoriteChat(fav)) return html;
+    const saved = favoriteMarkup(html);
+    if (saved.content.querySelector(FRAME_MARKER)) return html;
     const live = getRenderedMessageContent(fav.messageId);
-    if (!live || !/<style[\s>]/i.test(live)) return html;
+    if (!live) return html;
     const liveMarkup = favoriteMarkup(live);
+    const previews = Array.from(liveMarkup.content.querySelectorAll(FRAME_MARKER));
+    const liveMessage = parentWin.SillyTavern.getContext().chat[fav.messageId];
+    if (previews.length && liveMessage?.mes === fav.message) {
+      const plain = favoriteMarkup(escapeHtml(fav.message).replace(/\r\n|\n|\r/g, '<br>'));
+      if (plain.innerHTML.trim() === saved.innerHTML.trim()) return live;
+      const stripped = liveMarkup.content.cloneNode(true);
+      // An earlier snapshot removed inline frames and left relocated placeholders in place.
+      stripped.querySelectorAll(FRAME_MARKER).forEach(marker => {
+        if (marker.classList.contains('mes-code-preview-placeholder')) {
+          marker.removeAttribute(FRAME_SOURCE);
+          marker.hidden = true;
+        } else marker.remove();
+      });
+      const withoutPreviews = doc.createElement('template');
+      withoutPreviews.content.append(stripped);
+      const liveStyles = takeFavoriteStyles(withoutPreviews).map(style => style.outerHTML);
+      const savedStyles = takeFavoriteStyles(saved).map(style => style.outerHTML);
+      if (savedStyles.every(style => liveStyles.includes(style))
+        && withoutPreviews.innerHTML.trim() === saved.innerHTML.trim()) return live;
+      return html;
+    }
+    if (saved.content.querySelector('style')) return html;
     const styles = takeFavoriteStyles(liveMarkup);
-    if (liveMarkup.innerHTML.trim() !== favoriteMarkup(html).innerHTML.trim()) return html;
+    if (liveMarkup.innerHTML.trim() !== saved.innerHTML.trim()) return html;
     return styles.map(style => style.outerHTML).join('') + html;
   }
 
@@ -3121,6 +3122,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
     const replacements = [];
     const hiddenButtons = [];
+    const frames = Array.from(content.querySelectorAll(`${FRAME_MARKER} > iframe`));
     let imageShadows = [];
 
     try {
@@ -3143,16 +3145,21 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
         if (choice === '1') shouldReplace = true;
       }
 
-      await document.fonts.ready;
+      await Promise.all(frames.map(frame => frameLoads.get(frame)));
+      await Promise.all([doc.fonts.ready, ...frames.map(frame => frame.contentDocument?.fonts?.ready)]);
 
       if (shouldReplace && userName) {
-        const walker = doc.createTreeWalker(body, NodeFilter.SHOW_TEXT);
-        let node;
-        while ((node = walker.nextNode())) {
-          if (node.parentElement?.closest('style')) continue;
-          if (node.nodeValue && node.nodeValue.includes(userName)) {
-            replacements.push({ node, original: node.nodeValue });
-            node.nodeValue = node.nodeValue.replace(new RegExp(escapeRegExp(userName), 'g'), '{{user}}');
+        const roots = [body, ...frames.map(frame => frame.contentDocument?.body).filter(Boolean)];
+        const pattern = new RegExp(escapeRegExp(userName), 'g');
+        for (const root of roots) {
+          const walker = root.ownerDocument.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+          let node;
+          while ((node = walker.nextNode())) {
+            if (node.parentElement?.closest('style')) continue;
+            if (node.nodeValue && node.nodeValue.includes(userName)) {
+              replacements.push({ node, original: node.nodeValue });
+              node.nodeValue = node.nodeValue.replace(pattern, '{{user}}');
+            }
           }
         }
       }
@@ -3165,6 +3172,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       content.style.overflow = 'visible';
       content.style.maxHeight = 'none';
       content.style.height = 'auto';
+      frames.forEach(fitFavoriteFrame);
 
       // 获取 SmartThemeBlurTintColor 并去掉透明度
       let themeBg = window.getComputedStyle(doc.body).getPropertyValue('--SmartThemeBlurTintColor').trim();
@@ -3219,6 +3227,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       content.style.overflow = originalContentOverflow;
       content.style.maxHeight = originalContentMaxHeight;
       content.style.height = originalContentHeight;
+      frames.forEach(fitFavoriteFrame);
 
       // 恢复UI按钮
       hiddenButtons.forEach(({ element, originalDisplay }) => {
@@ -3234,7 +3243,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     }
   }
 
-  async function openReadingModal(fav) {
+  async function openReadingModal(fav, readingList = state.favorites) {
     const modal = doc.getElementById(MODAL_ID);
     if (!modal) return;
 
@@ -3244,8 +3253,8 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       logger.warn('[ChatSearch] failed to load favorite payload:', error);
     }
 
-    const currentIndex = state.favorites.findIndex(f => f.id === fav.id);
-    const hasPrev = currentIndex < state.favorites.length - 1;
+    const currentIndex = readingList.findIndex(f => f.id === fav.id);
+    const hasPrev = currentIndex >= 0 && currentIndex < readingList.length - 1;
     const hasNext = currentIndex > 0;
 
     const timestamp = new Date(fav.createdAt).toLocaleString('zh-CN', {
@@ -3317,7 +3326,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       </div>
     `;
 
-    renderFavoriteMarkup(modal.querySelector('.th-modal-message'), restoreFavoriteStyles(fav, messageContent), `#${MODAL_ID} .th-modal-message`);
+    renderFavoriteMarkup(modal.querySelector('.th-modal-message'), restoreFavoritePresentation(fav, messageContent), `#${MODAL_ID} .th-modal-message`);
 
     const closeBtn = modal.querySelector('.th-modal-close');
     const exportBtn = modal.querySelector('.th-modal-export');
@@ -3334,7 +3343,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
     closeBtn.addEventListener('click', closeModal);
     exportBtn.addEventListener('click', exportModalAsImage);
-    editBtn.addEventListener('click', () => void openFavoriteEditor(fav));
+    editBtn.addEventListener('click', () => void openFavoriteEditor(fav, readingList));
     loadBtn?.addEventListener('click', async () => {
       const floor = await jumpToMessageWithAutoLoad(fav.messageId, fav.chatId, fav.characterAvatar, {
         groupId: fav.groupId,
@@ -3360,19 +3369,19 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
         logger.warn('[ChatSearch] save loaded favorite failed:', error);
       }
 
-      void openReadingModal(fav);
+      void openReadingModal(fav, readingList);
     });
     backdrop.addEventListener('click', closeModal);
 
     if (hasPrev) {
       prevBtn.addEventListener('click', () => {
-        void openReadingModal(state.favorites[currentIndex + 1]);
+        void openReadingModal(readingList[currentIndex + 1], readingList);
       });
     }
 
     if (hasNext) {
       nextBtn.addEventListener('click', () => {
-        void openReadingModal(state.favorites[currentIndex - 1]);
+        void openReadingModal(readingList[currentIndex - 1], readingList);
       });
     }
 
@@ -3468,158 +3477,94 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     }
   }
 
-  function createResultRow(match) {
+  function highlightSearchText(target, text, pattern) {
+    let start = 0;
+    for (const match of text.matchAll(pattern)) {
+      const mark = doc.createElement('mark');
+      mark.textContent = match[0];
+      target.append(text.slice(start, match.index), mark);
+      start = match.index + match[0].length;
+    }
+    target.append(text.slice(start));
+  }
+
+  function createFavoriteSearchRow(fav, readingList, pattern) {
     const row = doc.createElement('article');
     row.className = 'th-chat-search-result';
-    row.dataset.messageId = String(match.message_id);
+    row.dataset.favoriteId = String(fav.id);
 
     const header = doc.createElement('div');
     header.className = 'th-chat-search-result-header';
-
     const title = doc.createElement('span');
     title.className = 'th-chat-search-result-title';
-    title.textContent = `#${match.message_id} · ${match.name || '未命名'}`;
-    header.appendChild(title);
-
-    const roleBadge = doc.createElement('span');
-    roleBadge.className = 'th-badge';
-    roleBadge.textContent = translateRole(match.role);
-    header.appendChild(roleBadge);
-
-    if (match.is_hidden) {
-      const hiddenBadge = doc.createElement('span');
-      hiddenBadge.className = 'th-badge';
-      hiddenBadge.textContent = '隐藏';
-      header.appendChild(hiddenBadge);
-    }
-
+    highlightSearchText(title, String(fav.title || '收藏'), pattern);
+    const badge = doc.createElement('span');
+    badge.className = 'th-badge';
+    badge.textContent = '收藏';
+    header.append(title, badge);
     row.appendChild(header);
 
+    if (fav.subtitle) {
+      const subtitle = doc.createElement('div');
+      subtitle.className = 'th-fav-subtitle';
+      highlightSearchText(subtitle, String(fav.subtitle), pattern);
+      row.appendChild(subtitle);
+    }
+
+    const source = doc.createElement('div');
+    source.className = 'th-card-subtitle';
+    source.textContent = [getFavoriteGallerySubtitle(fav),
+      fav.messageId == null ? '' : `#${fav.messageId}`].filter(Boolean).join(' · ');
+    if (source.textContent) row.appendChild(source);
+
+    const open = () => void openReadingModal(fav, readingList);
+    const button = createIconButton('fa-eye', '查看收藏');
+    button.addEventListener('click', event => {
+      event.stopPropagation();
+      open();
+    });
     const actions = doc.createElement('div');
     actions.className = 'th-chat-search-result-actions';
-
-    const previewBtn = createIconButton('fa-eye', '预览');
-    const jumpBtn = createIconButton('fa-location-arrow', '跳转');
-
-    actions.appendChild(previewBtn);
-    actions.appendChild(jumpBtn);
+    actions.appendChild(button);
     row.appendChild(actions);
-
-    const allMatches = findAllMatches(match.message, state.keywords);
-    const matchGroups = groupMatches(allMatches);
-    const matchCount = matchGroups.length;
-    let currentMatchIndex = 0;
-
-    const matchNav = doc.createElement('div');
-    matchNav.className = 'th-match-nav';
-    const prevBtn = doc.createElement('button');
-    prevBtn.className = 'th-match-nav-btn';
-    prevBtn.innerHTML = '<i class="fa-solid fa-chevron-left"></i>';
-    const matchInfo = doc.createElement('span');
-    matchInfo.textContent = `匹配 ${matchCount} 处`;
-    const nextBtn = doc.createElement('button');
-    nextBtn.className = 'th-match-nav-btn';
-    nextBtn.innerHTML = '<i class="fa-solid fa-chevron-right"></i>';
-    matchNav.appendChild(prevBtn);
-    matchNav.appendChild(matchInfo);
-    matchNav.appendChild(nextBtn);
-    row.appendChild(matchNav);
-
-    const snippet = doc.createElement('div');
-    snippet.className = 'th-chat-search-result-snippet';
-    row.appendChild(snippet);
-
-    const updateSnippet = () => {
-      snippet.innerHTML = buildSnippet(match.message, state.keywords, currentMatchIndex);
-      matchInfo.textContent = `${currentMatchIndex + 1} / ${matchCount}`;
-      prevBtn.disabled = currentMatchIndex === 0;
-      nextBtn.disabled = currentMatchIndex === matchCount - 1;
-    };
-
-    const toggleSnippet = forceVisible => {
-      const isOpen = snippet.classList.contains('th-expanded');
-      const shouldOpen = typeof forceVisible === 'boolean' ? forceVisible : !isOpen;
-      snippet.classList.toggle('th-expanded', shouldOpen);
-      matchNav.classList.toggle('th-visible', shouldOpen && matchCount > 1);
-      row.classList.toggle('th-open', shouldOpen);
-      if (shouldOpen) {
-        updateSnippet();
-        markSelectedRow(match.message_id);
-      } else if (isOpen) {
-        markSelectedRow(null);
-      }
-    };
-
-    prevBtn.addEventListener('click', e => {
-      e.stopPropagation();
-      if (currentMatchIndex > 0) {
-        currentMatchIndex--;
-        updateSnippet();
-      }
-    });
-
-    nextBtn.addEventListener('click', e => {
-      e.stopPropagation();
-      if (currentMatchIndex < matchCount - 1) {
-        currentMatchIndex++;
-        updateSnippet();
-      }
-    });
-
-    previewBtn.addEventListener('click', event => {
-      event.stopPropagation();
-      toggleSnippet();
-    });
-
-    jumpBtn.addEventListener('click', event => {
-      event.stopPropagation();
-      toggleSnippet(true);
-      void jumpToMessageWithAutoLoad(match.message_id);
-    });
-
-    row.addEventListener('click', () => toggleSnippet());
-
+    row.addEventListener('click', open);
     return row;
   }
 
-  function renderResults(matches, keyword) {
+  function renderResults(favorites, keywords) {
     if (!elements) return;
 
     elements.results.innerHTML = '';
 
-    if (!keyword) {
+    if (!keywords.length) {
       elements.counter.textContent = '就绪';
-      setEmptyMessage('请输入关键词开始搜索');
-      state.matches = [];
-      state.keywords = [];
-      state.fullMatchCount = 0;
-      markSelectedRow(null);
+      setEmptyMessage('输入标题或金句，搜索所有聊天中的收藏');
       return;
     }
 
-    if (!matches.length) {
+    if (!favorites.length) {
       elements.counter.textContent = '无结果';
-      setEmptyMessage('未找到匹配内容');
-      state.matches = [];
-      markSelectedRow(null);
+      setEmptyMessage('未找到匹配的收藏');
       return;
     }
 
-    const truncated = state.fullMatchCount > matches.length;
-    if (truncated) {
-      elements.counter.textContent = `显示 ${matches.length} 条，实际 ${state.fullMatchCount} 条。`;
-    } else {
-      elements.counter.textContent = `${matches.length} 条结果。`;
-    }
+    const groups = groupFavoritesByCharacter(favorites);
+    elements.counter.textContent = `${favorites.length} 条收藏 · ${groups.length} 个角色`;
     setEmptyMessage('');
-    markSelectedRow(null);
 
-    matches.forEach((match, index) => {
-      const row = createResultRow(match);
-      row.classList.add('th-animate-in');
-      row.style.animationDelay = `${index * 0.03}s`;
-      elements.results.appendChild(row);
-    });
+    const pattern = new RegExp(keywords.slice().sort((a, b) => b.length - a.length).map(escapeRegExp).join('|'), 'gi');
+    for (const group of groups) {
+      const section = doc.createElement('section');
+      section.className = 'th-favorite-search-group';
+      const heading = doc.createElement('h3');
+      heading.textContent = group.name;
+      section.appendChild(heading);
+      const readingList = group.favorites.slice().reverse();
+      for (const favorite of group.favorites) {
+        section.appendChild(createFavoriteSearchRow(favorite, readingList, pattern));
+      }
+      elements.results.appendChild(section);
+    }
   }
 
   function renderFavorites() {
@@ -3711,16 +3656,21 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   }
 
   async function reloadFavorites() {
+    if (state.currentMode === 'search') return performSearch();
+
     const currentChatId = getCurrentChatId();
 
     if (state.currentMode === 'favorites') {
       // 收藏模式：只显示当前聊天的收藏
       const allFavorites = currentChatId ? await getFavoritesByChatIdDB(currentChatId) : [];
+      if (state.currentMode !== 'favorites') return;
       state.favorites = allFavorites.filter(fav => !fav.deletedAt && isFavoriteChat(fav));
       renderFavorites();
     } else if (state.currentMode === 'gallery') {
       // 展馆模式：显示所有角色的所有收藏（全局通用）
-      state.favorites = (await getAllFavoritesDB({ includePayload: false })).filter(fav => !fav.deletedAt);
+      const allFavorites = await getAllFavoritesDB({ includePayload: false });
+      if (state.currentMode !== 'gallery') return;
+      state.favorites = allFavorites.filter(fav => !fav.deletedAt);
       if (state.selectedCharacter) {
         renderCharacterDetail(state.selectedCharacter);
       } else {
@@ -3729,47 +3679,37 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     }
   }
 
-  function getFavoriteGalleryGroupKey(fav) {
-    const charName = String(fav.charName || '未知').trim() || '未知';
-    const characterAvatar = String(fav.characterAvatar || 'unknown').trim() || 'unknown';
-    const chatId = String(fav.chatId || 'unknown').trim() || 'unknown';
-    return `${charName}::${characterAvatar}::${chatId}`;
-  }
-
   function getFavoriteGallerySubtitle(fav) {
     const chatName = String(fav.chatName || '').trim();
-    if (chatName) return chatName;
-
     const chatId = String(fav.chatId || '').trim();
-    return chatId && chatId !== 'unknown' ? chatId : '';
+    return [...new Set([chatName, chatId].filter(value => value && value !== 'unknown'))].join(' · ');
   }
 
-  function groupFavoritesByCharacter() {
-    const grouped = {};
-    state.favorites.forEach(fav => {
-      const key = getFavoriteGalleryGroupKey(fav);
-      const charName = fav.charName || '未知';
-      if (!grouped[key]) {
-        grouped[key] = {
-          key,
-          name: charName,
-          subtitle: getFavoriteGallerySubtitle(fav),
+  function groupFavoritesByCharacter(favorites = state.favorites) {
+    const characters = parentWin.SillyTavern.getContext().characters ?? [];
+    const characterNames = new Map(Object.values(characters).filter(Boolean).map(character => [character.avatar, character.name]));
+    const grouped = new Map();
+    const newestFirst = favorites.slice().sort((a, b) => b.createdAt - a.createdAt || b.id - a.id);
+    for (const fav of newestFirst) {
+      const avatar = fav.characterAvatar && fav.characterAvatar !== 'unknown' ? fav.characterAvatar : '';
+      const ownerName = fav.groupId ? '' : characterNames.get(avatar);
+      const name = String(fav.characterName || ownerName || fav.charName || '').trim() || '未知';
+      if (!grouped.has(name)) {
+        grouped.set(name, {
+          key: name,
+          name,
           favorites: [],
-          lastFavoriteDate: 0,
+          lastFavoriteDate: fav.createdAt,
           coverImage: null,
-          characterAvatar: fav.characterAvatar,
-          chatId: fav.chatId,
-        };
+          characterAvatar: '',
+        });
       }
-      grouped[key].favorites.push(fav);
-      if (fav.createdAt > grouped[key].lastFavoriteDate) {
-        grouped[key].lastFavoriteDate = fav.createdAt;
-      }
-      if (fav.coverThumbnail) {
-        grouped[key].coverImage = fav.coverThumbnail;
-      }
-    });
-    return Object.values(grouped).sort((a, b) => b.lastFavoriteDate - a.lastFavoriteDate);
+      const group = grouped.get(name);
+      group.favorites.push(fav);
+      group.coverImage ||= fav.coverThumbnail;
+      group.characterAvatar ||= avatar;
+    }
+    return [...grouped.values()];
   }
 
   async function renderGalleryList() {
@@ -3784,7 +3724,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       return;
     }
 
-    elements.counter.textContent = `共 ${characters.length} 个分组`;
+    elements.counter.textContent = `共 ${characters.length} 个角色`;
     setEmptyMessage('');
 
     const listContainer = doc.createElement('div');
@@ -3808,22 +3748,20 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
       const content = doc.createElement('div');
       content.className = 'th-card-content';
-      const detailText = char.subtitle
-        ? `${char.favorites.length} 条收藏 · ${escapeHtml(char.subtitle)}`
-        : `${char.favorites.length} 条收藏`;
       content.innerHTML = `
         <div class="th-card-title">${escapeHtml(char.name)}</div>
-        <div class="th-card-subtitle">${detailText}</div>
+        <div class="th-card-subtitle">${char.favorites.length} 条收藏</div>
       `;
-
-      const coverImg = doc.createElement('img');
-      coverImg.className = 'th-card-cover';
-      coverImg.alt = '封面';
-      coverImg.src = char.coverImage || `/characters/${char.characterAvatar}`;
 
       card.appendChild(dateDiv);
       card.appendChild(content);
-      card.appendChild(coverImg);
+      if (char.coverImage || char.characterAvatar) {
+        const coverImg = doc.createElement('img');
+        coverImg.className = 'th-card-cover';
+        coverImg.alt = '封面';
+        coverImg.src = char.coverImage || `/characters/${char.characterAvatar}`;
+        card.appendChild(coverImg);
+      }
 
       card.addEventListener('click', () => {
         state.selectedCharacter = char.key;
@@ -3858,7 +3796,8 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     elements.counter.textContent = `${char.name} (${char.favorites.length} 条收藏)`;
     elements.results.appendChild(backBtn);
 
-    const sortedFavs = char.favorites.slice().sort((a, b) => b.createdAt - a.createdAt);
+    const sortedFavs = char.favorites;
+    const readingList = sortedFavs.slice().reverse();
 
     sortedFavs.forEach((fav, index) => {
       const card = doc.createElement('div');
@@ -3881,10 +3820,11 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       });
 
       const subtitleHtml = fav.subtitle ? `<div class="th-fav-subtitle">${escapeHtml(fav.subtitle)}</div>` : '';
+      const source = getFavoriteGallerySubtitle(fav);
       content.innerHTML = `
         <div class="th-card-title">${escapeHtml(fav.title)}</div>
         ${subtitleHtml}
-        <div class="th-card-subtitle">${timestamp}</div>
+        <div class="th-card-subtitle">${escapeHtml([source, timestamp].filter(Boolean).join(' · '))}</div>
       `;
 
       wrapper.appendChild(content);
@@ -3921,7 +3861,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       actions.appendChild(jumpBtn);
       actions.appendChild(delBtn);
 
-      card.addEventListener('click', () => void openReadingModal(fav));
+      card.addEventListener('click', () => void openReadingModal(fav, readingList));
 
       card.appendChild(wrapper);
       card.appendChild(actions);
@@ -3940,7 +3880,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
     if (mode === 'search') {
       elements.controls.style.display = '';
-      renderResults(state.matches, elements.input.value.trim());
+      void performSearch();
     } else if (mode === 'favorites') {
       elements.controls.style.display = 'none';
       state.selectedCharacter = null;
@@ -3964,6 +3904,8 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       // 打开面板时重新加载当前模式的数据
       if (state.currentMode === 'favorites' || state.currentMode === 'gallery') {
         void reloadFavorites();
+      } else if (elements.input.value.trim()) {
+        void performSearch();
       }
       if (focusInput && state.currentMode === 'search') {
         requestAnimationFrame(() => {
@@ -3982,46 +3924,34 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     togglePanel(false);
   }
 
-  function performSearch() {
-    if (!state.helper || !elements) return;
+  async function performSearch() {
+    if (!elements || state.currentMode !== 'search') return;
 
-    const raw = elements.input.value.trim();
+    const panel = elements;
+    const request = ++state.searchRequest;
+    const raw = panel.input.value.trim();
     const keywords = raw.toLowerCase().split(/\s+/).filter(Boolean);
-    state.keywords = keywords;
-
     if (!raw) {
-      renderResults([], '');
+      renderResults([], keywords);
       return;
     }
 
-    const lastId = state.helper.getLastMessageId?.();
-    if (typeof lastId !== 'number' || Number.isNaN(lastId) || lastId < 0) {
-      renderResults([], raw);
-      setEmptyMessage('当前聊天暂无消息');
-      return;
-    }
-
-    let messages = [];
+    const isCurrent = () => elements === panel && request === state.searchRequest && state.currentMode === 'search'
+      && panel.input.value.trim() === raw && panel.panel.isConnected;
     try {
-      messages = state.helper.getChatMessages(`0-${lastId}`, { include_swipes: false });
+      const favorites = (await getAllFavoritesDB({ includePayload: false })).filter(fav => {
+        const text = `${fav.title ?? ''}\n${fav.subtitle ?? ''}`.toLowerCase();
+        return !fav.deletedAt && keywords.every(term => text.includes(term));
+      });
+      if (isCurrent()) renderResults(favorites, keywords);
     } catch (error) {
-      logger.error('[ChatSearch] getChatMessages failed:', error);
-      if (notifier && typeof notifier.error === 'function') {
-        notifier.error('搜索失败，详见控制台。');
+      logger.error('[ChatSearch] favorite search failed:', error);
+      if (isCurrent()) {
+        elements.results.innerHTML = '';
+        elements.counter.textContent = '读取收藏失败';
+        setEmptyMessage('读取收藏失败，请重试');
       }
-      return;
     }
-
-    const filtered = messages.filter(item => {
-      if (!keywords.length) return true;
-      const text = String(item.message ?? '').toLowerCase();
-      return keywords.every(term => text.includes(term));
-    });
-
-    state.fullMatchCount = filtered.length;
-    const display = filtered.slice(0, MAX_RESULTS);
-    state.matches = display;
-    renderResults(display, raw);
   }
 
   function attachHandlers() {
@@ -4159,7 +4089,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     buildUI();
     attachHandlers();
     state.cleanupEntrypoints = installChatSearchEntrypoints(doc, () => openPanel(true));
-    renderResults([], '');
+    renderResults([], []);
 
     // Pull/push is triggered when the panel enters favorites/gallery, or when local changes happen.
 
@@ -4175,7 +4105,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
         switchMode('gallery');
         openPanel();
       },
-      version: '1.1.2',
+      version: '1.2.0',
     };
   }
 

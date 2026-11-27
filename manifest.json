@@ -3,7 +3,7 @@
   "loading_order": 80,
   "requires": [],
   "js": "index.js",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "author": "千秋梦（原脚本）、kaelisvespera（移植）",
   "homePage": "https://github.com/kaelisvespera/tavern-chat-clips"
 }

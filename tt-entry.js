@@ -1,14 +1,6 @@
 export function createTavernChatHelper(getContext) {
     return {
-        getLastMessageId() {
-            const context = getContext();
-            if (!context.chat?.length) return -1;
-            const last = context.substituteParamsExtended?.('{{lastMessageId}}');
-            if (last === '') return -1;
-            return /^\d+$/.test(last) ? Number(last) : context.chat.length - 1;
-        },
-
-        // The original search only reads the active reply of each message.
+        // A floor snapshot reads the active reply of the chosen message.
         getChatMessages(range) {
             const chat = getContext().chat ?? [];
             const bounds = String(range).match(/^(-?\d+)(?:-(-?\d+))?$/);
