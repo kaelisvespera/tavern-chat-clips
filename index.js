@@ -2,6 +2,7 @@
 import { css } from '/lib.js';
 import { download } from '/scripts/utils.js';
 import { createTavernChatHelper, installChatSearchEntrypoints } from './tt-entry.js';
+import { freezeRenderedAppearance } from './rendered-appearance.js';
 import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
 (() => {
@@ -16,6 +17,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   const logger = window.log ?? parentWin.log ?? console;
 
   const PANEL_ID = 'th-chat-search-panel';
+  const PANEL_BACKDROP_ID = 'th-chat-search-backdrop';
   const STYLE_ID = 'th-chat-search-style';
   const INPUT_ID = 'th-chat-search-input';
   const RESULT_ID = 'th-chat-search-results';
@@ -32,6 +34,12 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   const PURGE_DELETED_PAYLOAD_FLAG = 'th-chat-search-purge-deleted-payload-v1';
   const FRAME_SOURCE = 'data-th-favorite-frame';
   const FRAME_MARKER = `[${FRAME_SOURCE}]`;
+  const FROZEN_APPEARANCE = '[data-th-frozen-appearance]';
+  const READER_SIZE_FRAME = '[data-th-reader-size-frame]';
+  const PANEL_HEIGHT_KEY = 'th-chat-search-panel-height';
+  const PANEL_HEIGHT_MIN = 40;
+  const PANEL_HEIGHT_DEFAULT = 100;
+  const PANEL_HEIGHT_STEP = 5;
   const PREVIEW_HOST = '.TH-render, .xiaobaix-iframe-wrapper, .mes-code-preview';
   const STAGED_PREVIEW = '.mes-code-preview-placeholder, .mes-code-preview-pending';
   const frameLoads = new WeakMap();
@@ -90,6 +98,10 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       larger.disabled = size >= READING_SIZE_MAX;
       reset.textContent = `${size}%`;
       reset.setAttribute('aria-label', `恢复默认字号，当前 ${size}%`);
+      content.querySelectorAll(READER_SIZE_FRAME).forEach(frame => {
+        applyReaderSizeToFrame(frame);
+        fitFavoriteFrame(frame);
+      });
     }
 
     function changeSize(size) {
@@ -207,7 +219,9 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     const clone = frameDoc.documentElement.cloneNode(true);
     const sheetSelector = 'style, link[rel~="stylesheet"]';
     const sheets = Array.from(frameDoc.querySelectorAll(sheetSelector));
-    clone.querySelectorAll(sheetSelector).forEach((node, index) => {
+    const copies = Array.from(clone.querySelectorAll(sheetSelector));
+    freezeRenderedAppearance(frameDoc.documentElement, clone, { scaleText: false });
+    copies.forEach((node, index) => {
       try {
         const sheet = sheets[index]?.sheet;
         if (sheet?.disabled) {
@@ -295,33 +309,67 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     if (contrast < 4.5) frameDoc.body.style.backgroundColor = foreground <= 0.179 ? '#fff' : '#000';
   }
 
-  function mountFavoriteFrame(container) {
+  function applyReaderSizeToFrame(frame) {
+    frame.contentDocument?.documentElement?.style.setProperty('--th-reading-scale', String(state.readingSize / 100));
+  }
+
+  function mountFavoriteFrame(container, legacyReader = false) {
     let source;
     try {
       source = decodeURIComponent(container.getAttribute(FRAME_SOURCE));
     } catch {
       return;
     }
-    const frame = doc.createElement('iframe');
+    const frame = container.ownerDocument.createElement('iframe');
     frame.title = '收藏的前端预览';
     frame.setAttribute('sandbox', 'allow-same-origin');
+    if (legacyReader) frame.setAttribute('data-th-reader-size-frame', '');
     frame.style.cssText = 'display:block;width:100%;border:0;height:1px;';
     frameLoads.set(frame, new Promise(resolve => {
-      frame.addEventListener('load', () => {
+      frame.addEventListener('load', async () => {
+        if (legacyReader) applyReaderSizeToFrame(frame);
+        const frameDoc = frame.contentDocument;
+        const nested = Array.from(frameDoc?.body?.querySelectorAll(FRAME_MARKER) ?? [], marker => mountFavoriteFrame(marker));
+        await Promise.all(nested.filter(Boolean).map(child => frameLoads.get(child)));
         keepTransparentPreviewReadable(frame);
         fitFavoriteFrame(frame);
-        frame.contentDocument?.addEventListener('toggle', () => fitFavoriteFrame(frame), true);
+        frameDoc?.addEventListener('toggle', () => fitFavoriteFrame(frame), true);
         resolve();
       }, { once: true });
     }));
     frame.srcdoc = '<!doctype html>' + sanitizeFavoriteFrame(source);
     container.replaceChildren(frame);
+    return frame;
   }
 
-  function renderFavoriteMarkup(target, html, scope) {
+  function mountLegacyStyles(target, template, styles, favorite) {
+    const computed = parentWin.getComputedStyle(target);
+    const style = doc.createElement('div').style;
+    style.margin = '0';
+    style.fontFamily = computed.fontFamily;
+    style.fontSize = `calc(${computed.fontSize} * var(--th-reading-scale, 1))`;
+    style.color = computed.color;
+    const lineHeight = parseFloat(computed.lineHeight) / parseFloat(computed.fontSize);
+    if (Number.isFinite(lineHeight)) style.lineHeight = String(lineHeight);
+
+    const marker = doc.createElement('div');
+    const messageId = Number.isInteger(favorite.messageId) ? favorite.messageId : '';
+    const html = `<html><head>${styles.map(node => node.outerHTML).join('')}</head><body style="${escapeHtml(style.cssText)}"><div id="chat"><div class="mes" mesid="${messageId}"><div class="mes_block"><div class="mes_text">${template.innerHTML}</div></div></div></div></body></html>`;
+    saveFrameSource(marker, html);
+    target.replaceChildren(marker);
+    mountFavoriteFrame(marker, true);
+  }
+
+  function renderFavoriteMarkup(target, html, scope, favorite = null) {
     const template = favoriteMarkup(html);
     const styles = takeFavoriteStyles(template);
+    const frozen = template.content.querySelector(FROZEN_APPEARANCE);
+    if (favorite && styles.length && !frozen) {
+      mountLegacyStyles(target, template, styles, favorite);
+      return '';
+    }
     for (const original of styles) {
+      if (frozen && !original.hasAttribute('data-th-frozen-pseudos')) continue;
       try {
         const scoped = doc.createElement('style');
         scoped.media = original.media;
@@ -332,7 +380,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       }
     }
     target.replaceChildren(template.content);
-    target.querySelectorAll(FRAME_MARKER).forEach(mountFavoriteFrame);
+    target.querySelectorAll(FRAME_MARKER).forEach(marker => mountFavoriteFrame(marker));
     return styles.map(style => style.outerHTML).join('');
   }
 
@@ -819,7 +867,6 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     highlightedElement: null,
     highlightTimer: null,
     keydownHandler: null,
-    docClickHandler: null,
     cleanupEntrypoints: null,
     currentMode: 'search',
     favorites: [],
@@ -839,6 +886,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   function cleanupElements() {
     const panel = doc.getElementById(PANEL_ID);
     if (panel) panel.remove();
+    doc.getElementById(PANEL_BACKDROP_ID)?.remove();
 
     const modal = doc.getElementById(MODAL_ID);
     if (modal) modal.remove();
@@ -852,11 +900,6 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     if (state.keydownHandler) {
       doc.removeEventListener('keydown', state.keydownHandler, true);
       state.keydownHandler = null;
-    }
-
-    if (state.docClickHandler) {
-      doc.removeEventListener('click', state.docClickHandler);
-      state.docClickHandler = null;
     }
 
     if (state.messageActionsObserver) {
@@ -877,6 +920,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     state.cleanupEntrypoints?.();
     state.cleanupEntrypoints = null;
     doc.querySelectorAll(`#chat .${MESSAGE_FAVORITE_BUTTON_CLASS}`).forEach(button => button.remove());
+    doc.documentElement.style.removeProperty('--th-panel-height-scale');
 
     elements = null;
   }
@@ -896,6 +940,24 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     const style = doc.createElement('style');
     style.id = STYLE_ID;
     style.textContent = `
+:root {
+  --th-panel-viewport-height: 100vh;
+  --th-panel-top: max(16px, calc((var(--th-panel-viewport-height) - 760px) / 2), env(safe-area-inset-top, 0px));
+  --th-panel-bottom: max(16px, env(safe-area-inset-bottom, 0px));
+  --th-panel-available-height: min(760px, calc(var(--th-panel-viewport-height) - var(--th-panel-top) - var(--th-panel-bottom)));
+  --th-panel-height-limit: min(var(--th-panel-available-height), max(230px, calc(var(--th-panel-available-height) * var(--th-panel-height-scale, 1))));
+}
+
+#${PANEL_BACKDROP_ID} {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 2147482999;
+}
+#${PANEL_BACKDROP_ID}:has(+ #${PANEL_ID}.th-visible) {
+  display: block;
+}
+
 #${PANEL_ID} {
   --th-bg-color: var(--SmartThemeBlurTintColor, rgba(18, 19, 27, 0.95));
   --th-text-color: var(--SmartThemeBodyColor, var(--text-color-high, #f5f6ff));
@@ -914,14 +976,12 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   --th-inline-bg-hover: color-mix(in srgb, var(--th-accent-color) 28%, transparent);
   --th-result-bg: color-mix(in srgb, var(--th-bg-color) 12%, transparent);
   --th-result-border: color-mix(in srgb, var(--th-border-color) 70%, transparent);
-  --th-panel-viewport-height: 100vh;
-
   position: fixed;
-  top: 50%;
+  top: var(--th-panel-top);
   left: 50%;
-  transform: translate(-50%, -50%);
+  transform: translateX(-50%);
   width: min(540px, calc(100vw - 48px));
-  max-height: min(760px, calc(var(--th-panel-viewport-height) - 32px));
+  max-height: var(--th-panel-height-limit);
   display: none;
   flex-direction: column;
   gap: 12px;
@@ -942,7 +1002,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 }
 
 @supports (height: 100dvh) {
-  #${PANEL_ID} {
+  :root {
     --th-panel-viewport-height: 100dvh;
   }
 }
@@ -986,16 +1046,20 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   top: calc(100% + 10px);
   right: 0;
   min-width: 200px;
+  max-height: min(260px, calc(var(--th-panel-viewport-height) / 2 - 32px));
   display: flex;
   flex-direction: column;
   gap: 8px;
   padding: 10px;
   border-radius: 14px;
-  background: color-mix(in srgb, var(--th-bg-color) 72%, transparent);
+  background: var(--th-bg-color);
+  background: rgb(from var(--th-bg-color) r g b / 96%);
   border: 1px solid color-mix(in srgb, var(--th-border-color) 90%, transparent);
   box-shadow: 0 18px 45px color-mix(in srgb, var(--th-shadow-color) 68%, transparent);
   backdrop-filter: blur(calc(var(--SmartThemeBlurStrength, 10px) * 1.25));
   z-index: 10;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
   scrollbar-gutter: stable;
 
   opacity: 0;
@@ -1030,6 +1094,69 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   gap: 10px;
   min-height: 36px;
   border-radius: 10px;
+}
+
+#${PANEL_ID} .th-panel-height-setting {
+  position: relative;
+  display: grid;
+  flex-shrink: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 4px 8px;
+  padding: 2px 2px 8px;
+  border-bottom: 1px solid var(--th-border-color);
+  font-size: 0.9em;
+}
+
+#${PANEL_ID} .th-panel-height-setting output {
+  text-align: end;
+  font-variant-numeric: tabular-nums;
+}
+
+#${PANEL_ID} .th-panel-height-setting label {
+  white-space: nowrap;
+}
+
+#${PANEL_ID} .th-panel-height-setting input {
+  -webkit-appearance: auto;
+  appearance: auto;
+  width: 100%;
+  min-width: 0;
+  min-height: 28px;
+  padding: 0;
+  margin: 0;
+  background: none;
+  box-shadow: none;
+  filter: none;
+  accent-color: var(--th-accent-color);
+}
+
+#${PANEL_ID} .th-panel-height-reset {
+  min-height: 32px;
+  padding: 4px 8px;
+  border: 1px solid var(--th-border-color);
+  border-radius: 6px;
+  background: var(--th-inline-bg);
+  color: inherit;
+  font: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+#${PANEL_ID} .th-panel-height-reset:hover {
+  background: var(--th-inline-bg-hover);
+}
+
+#${PANEL_ID} .th-panel-height-setting :focus-visible {
+  outline: 2px solid var(--th-accent-color);
+  outline-offset: -1px;
+}
+
+#${PANEL_ID} .th-actions-data {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  gap: 8px;
 }
 
 .extraMesButtons .th-chat-search-mes-favorite {
@@ -1270,13 +1397,12 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 }
 
 @media (max-width: 680px) {
-  #${PANEL_ID} {
+  :root {
     --th-panel-top: calc(clamp(12px, 9vh, 64px) + env(safe-area-inset-top, 0px));
     --th-panel-bottom: max(12px, env(safe-area-inset-bottom, 0px));
-    top: var(--th-panel-top);
-    transform: translateX(-50%);
+  }
+  #${PANEL_ID} {
     width: calc(100vw - 24px);
-    max-height: min(760px, calc(var(--th-panel-viewport-height) - var(--th-panel-top) - var(--th-panel-bottom)));
     padding: 16px;
     border-radius: 12px;
   }
@@ -1316,10 +1442,11 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   top: 0;
   left: 0;
   width: 100vw;
-  height: 100vh;
+  height: var(--th-panel-viewport-height);
+  padding-top: var(--th-panel-top);
   z-index: 2147483647;
   display: none;
-  align-items: center;
+  align-items: flex-start;
   justify-content: center;
   opacity: 0;
   transition: opacity 0.3s ease;
@@ -1344,7 +1471,8 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   display: flex;
   flex-direction: column;
   width: min(680px, calc(100vw - 48px));
-  max-height: calc(100vh - 96px);
+  max-height: var(--th-panel-height-limit);
+  transform-origin: top center;
   background: color-mix(in srgb, var(--SmartThemeBlurTintColor, rgba(18, 19, 27, 0.92)) 95%, transparent);
   border: 1px solid color-mix(in srgb, var(--SmartThemeBorderColor, rgba(129, 140, 248, 0.25)) 80%, transparent);
   border-radius: 20px;
@@ -1358,11 +1486,11 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 @keyframes th-modal-fadein {
   from {
     opacity: 0;
-    transform: scale(0.95) translateY(20px);
+    transform: scale(0.98);
   }
   to {
     opacity: 1;
-    transform: scale(1) translateY(0);
+    transform: scale(1);
   }
 }
 
@@ -1445,31 +1573,40 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   transform: translateY(-50%);
   width: 48px;
   height: 48px;
-  background: color-mix(in srgb, var(--SmartThemeBlurTintColor, rgba(18, 19, 27, 0.85)) 90%, transparent);
-  border: 1px solid color-mix(in srgb, var(--SmartThemeBorderColor, rgba(129, 140, 248, 0.3)) 60%, transparent);
+  background: transparent;
+  border: 0;
   border-radius: 50%;
+  color: var(--SmartThemeBodyColor, var(--text-color-high, #f5f6ff));
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
-  opacity: 0.6;
-  transition: opacity 0.2s ease, transform 0.2s ease, background 0.2s ease;
+  opacity: 0.55;
+  transition: opacity 0.15s ease, background 0.15s ease;
+  touch-action: manipulation;
   z-index: 10;
 }
 
-.th-modal-nav:hover {
-  opacity: 1;
-  background: color-mix(in srgb, var(--SmartThemeBlurTintColor, rgba(18, 19, 27, 0.95)) 95%, transparent);
-  transform: translateY(-50%) scale(1.05);
+@media (hover: hover) and (pointer: fine) {
+  .th-modal-nav:hover:not(:disabled) {
+    opacity: 1;
+    background: color-mix(in srgb, currentColor 10%, transparent);
+  }
 }
 
-.th-modal-nav:active {
-  transform: translateY(-50%) scale(0.95);
+.th-modal-nav:active:not(:disabled),
+.th-modal-nav:focus-visible {
+  opacity: 1;
+  background: color-mix(in srgb, currentColor 14%, transparent);
+}
+
+.th-modal-nav:focus-visible {
+  outline: 2px solid var(--SmartThemeQuoteColor, currentColor);
+  outline-offset: -3px;
 }
 
 .th-modal-nav:disabled {
-  opacity: 0.25;
-  cursor: not-allowed;
+  opacity: 0;
   pointer-events: none;
 }
 
@@ -1482,7 +1619,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 }
 
 .th-modal-nav i {
-  font-size: 18px;
+  font-size: 13px;
 }
 
 .th-modal-body {
@@ -1695,7 +1832,6 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 @media (max-width: 768px) {
   .th-modal-content {
     width: calc(100vw - 32px);
-    max-height: calc(100vh - 64px);
     border-radius: 16px;
   }
 
@@ -1741,14 +1877,8 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 }
 
 @media (max-width: 480px) {
-  #${MODAL_ID} {
-    align-items: flex-start;
-    padding-top: 20px;
-  }
-
   .th-modal-content {
     width: calc(100vw - 24px);
-    max-height: calc(100vh - 140px);
     border-radius: 14px;
   }
 
@@ -1804,7 +1934,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   }
 
   .th-modal-nav i {
-    font-size: 16px;
+    font-size: 12px;
   }
 }
 
@@ -2363,7 +2493,10 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       wrapper.remove();
     };
 
-    backdrop.addEventListener('click', close);
+    backdrop.addEventListener('click', event => {
+      event.stopPropagation();
+      close();
+    });
     closeBtn.addEventListener('click', close);
     cancelBtn.addEventListener('click', close);
 
@@ -2691,30 +2824,62 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     const moreBtn = createIconButton('fa-ellipsis', '更多');
     moreBtn.classList.add('th-actions-toggle');
     moreBtn.title = '更多操作';
-    moreBtn.setAttribute('aria-haspopup', 'menu');
     moreBtn.setAttribute('aria-expanded', 'false');
     actionsMenu.appendChild(moreBtn);
 
     const actionsPopover = doc.createElement('div');
+    actionsPopover.id = `${PANEL_ID}-more`;
     actionsPopover.className = 'th-actions-popover';
-    actionsPopover.setAttribute('role', 'menu');
+    actionsPopover.setAttribute('role', 'group');
+    actionsPopover.setAttribute('aria-label', '更多操作');
     actionsPopover.setAttribute('aria-hidden', 'true');
+    moreBtn.setAttribute('aria-controls', actionsPopover.id);
     actionsMenu.appendChild(actionsPopover);
+
+    const heightSetting = doc.createElement('div');
+    heightSetting.className = 'th-panel-height-setting';
+    const heightSlider = doc.createElement('input');
+    heightSlider.id = `${PANEL_ID}-height`;
+    heightSlider.type = 'range';
+    heightSlider.min = String(PANEL_HEIGHT_MIN);
+    heightSlider.max = String(PANEL_HEIGHT_DEFAULT);
+    heightSlider.step = String(PANEL_HEIGHT_STEP);
+    heightSlider.value = String(PANEL_HEIGHT_DEFAULT);
+    try {
+      const saved = Number(parentWin.localStorage.getItem(PANEL_HEIGHT_KEY));
+      if (saved >= PANEL_HEIGHT_MIN && saved <= PANEL_HEIGHT_DEFAULT) heightSlider.value = String(saved);
+    } catch {
+      // The default stays available when browser preferences cannot be read.
+    }
+    const heightLabel = doc.createElement('label');
+    heightLabel.htmlFor = heightSlider.id;
+    heightLabel.textContent = '面板高度上限';
+    const heightValue = doc.createElement('output');
+    heightValue.setAttribute('for', heightSlider.id);
+    heightValue.setAttribute('aria-hidden', 'true');
+    const heightReset = doc.createElement('button');
+    heightReset.type = 'button';
+    heightReset.className = 'th-panel-height-reset';
+    heightReset.textContent = '恢复默认';
+    heightReset.setAttribute('aria-label', '恢复默认面板高度');
+    heightSetting.append(heightLabel, heightValue, heightSlider, heightReset);
+    actionsPopover.appendChild(heightSetting);
+
+    const dataMenu = doc.createElement('div');
+    dataMenu.className = 'th-actions-data';
+    dataMenu.setAttribute('role', 'menu');
+    dataMenu.setAttribute('aria-label', '收藏数据');
+    actionsPopover.appendChild(dataMenu);
 
     const exportBtn = createIconButton('fa-download', '导出');
     exportBtn.title = '导出收藏数据（JSON，完整快照，含已删除记录）';
     exportBtn.setAttribute('role', 'menuitem');
-    actionsPopover.appendChild(exportBtn);
+    dataMenu.appendChild(exportBtn);
 
     const importBtn = createIconButton('fa-upload', '导入');
     importBtn.title = '导入收藏数据（JSON）';
     importBtn.setAttribute('role', 'menuitem');
-    actionsPopover.appendChild(importBtn);
-
-    const latestBtn = createIconButton('fa-angles-down', '最新视图');
-    latestBtn.title = '回到最新视图';
-    latestBtn.setAttribute('role', 'menuitem');
-    actionsPopover.appendChild(latestBtn);
+    dataMenu.appendChild(importBtn);
 
     headerActions.appendChild(actionsMenu);
 
@@ -2757,7 +2922,10 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     emptyNotice.textContent = '请输入关键词开始搜索';
     panel.appendChild(emptyNotice);
 
-    doc.body.appendChild(panel);
+    const panelBackdrop = doc.createElement('div');
+    panelBackdrop.id = PANEL_BACKDROP_ID;
+    panelBackdrop.setAttribute('aria-hidden', 'true');
+    doc.body.append(panelBackdrop, panel);
 
     const modal = doc.createElement('div');
     modal.id = MODAL_ID;
@@ -2768,6 +2936,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
     elements = {
       panel,
+      panelBackdrop,
       closeBtn,
       searchBtn,
       input,
@@ -2779,13 +2948,30 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       galleryTab,
       controls,
       modal,
-      latestBtn,
+      heightSlider,
+      heightValue,
+      heightReset,
       exportBtn,
       importBtn,
       moreBtn,
       actionsMenu,
       actionsPopover,
     };
+    applyPanelHeight();
+  }
+
+  function applyPanelHeight(persist = false) {
+    const percent = elements.heightSlider.valueAsNumber;
+    const label = `${percent}%`;
+    doc.documentElement.style.setProperty('--th-panel-height-scale', String(percent / 100));
+    elements.heightValue.textContent = label;
+    elements.heightSlider.setAttribute('aria-valuetext', label);
+    if (!persist) return;
+    try {
+      parentWin.localStorage.setItem(PANEL_HEIGHT_KEY, String(percent));
+    } catch {
+      // The adjusted height stays usable for the current session.
+    }
   }
 
   function isActionsPopoverOpen() {
@@ -2798,10 +2984,12 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       return;
     }
 
+    const restoreFocus = !visible && elements.actionsPopover.contains(doc.activeElement);
     elements.actionsPopover.classList.toggle('th-popover-open', visible);
     elements.actionsPopover.setAttribute('aria-hidden', visible ? 'false' : 'true');
     elements.moreBtn.setAttribute('aria-expanded', visible ? 'true' : 'false');
     state.actionsPopoverOpen = visible;
+    if (restoreFocus) elements.moreBtn.focus();
   }
 
   function toggleActionsPopover(force) {
@@ -3053,7 +3241,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     void openFavoriteEditor(fav);
   }
 
-  async function getRenderedMessageContent(messageId) {
+  async function getRenderedMessageContent(messageId, { freeze = true } = {}) {
     try {
       const chatContainer = getChatContainer();
       if (!chatContainer) return null;
@@ -3065,6 +3253,10 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       if (!mesText) return null;
 
       const snapshot = mesText.cloneNode(true);
+      if (freeze) {
+        freezeRenderedAppearance(mesText, snapshot);
+        snapshot.classList.remove('mes_text');
+      }
       const frames = Array.from(mesText.querySelectorAll('iframe'));
       const media = Array.from(mesElement.querySelectorAll('.mes_img_container'))
         .filter(container => !mesText.contains(container))
@@ -3075,7 +3267,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
         replaceFavoriteFrame(frame, source);
       }));
       addPreviewSources(snapshot);
-      const content = safeFavoriteHtml(snapshot.innerHTML + media);
+      const content = safeFavoriteHtml((freeze ? snapshot.outerHTML : snapshot.innerHTML) + media);
       if (frames.length && !snapshot.textContent.trim()
         && !snapshot.querySelector(`img, video, audio, ${FRAME_MARKER}`) && !media) return null;
 
@@ -3089,13 +3281,14 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     // Recover presentation lost by older versions without replacing edited snapshots.
     if (!html || !isFavoriteChat(fav)) return html;
     const saved = favoriteMarkup(html);
-    if (saved.content.querySelector(FRAME_MARKER)) return html;
+    if (saved.content.querySelector(`${FRAME_MARKER}, ${FROZEN_APPEARANCE}`)) return html;
     const sourceMessage = parentWin.SillyTavern.getContext().chat[fav.messageId]?.mes;
-    const live = await getRenderedMessageContent(fav.messageId);
+    if (sourceMessage !== fav.message) return html;
+    const live = await getRenderedMessageContent(fav.messageId, { freeze: false });
     if (!live) return html;
     const liveMarkup = favoriteMarkup(live);
     const previews = Array.from(liveMarkup.content.querySelectorAll(FRAME_MARKER));
-    if (previews.length && sourceMessage === fav.message) {
+    if (previews.length) {
       const plain = favoriteMarkup(escapeHtml(fav.message).replace(/\r\n|\n|\r/g, '<br>'));
       if (plain.innerHTML.trim() === saved.innerHTML.trim()) return live;
       const stripped = liveMarkup.content.cloneNode(true);
@@ -3123,27 +3316,41 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   function processModalImages(modalElement, imagesData) {
     if (!imagesData?.length) return;
 
-    const imgs = modalElement.querySelectorAll('.th-modal-message img');
-    imgs.forEach((img, index) => {
-      const imageData = imagesData[index];
-      if (!imageData) return;
+    const message = modalElement.querySelector('.th-modal-message');
+    const legacyFrame = message.querySelector(READER_SIZE_FRAME);
+    if (legacyFrame) {
+      void frameLoads.get(legacyFrame)?.then(() => {
+        if (legacyFrame.contentDocument?.body) applyImageFallbacks(legacyFrame.contentDocument.body);
+      });
+    } else {
+      applyImageFallbacks(message);
+    }
 
-      const originalSrc = imageData.originalSrc;
-      const thumbnail = imageData.thumbnail;
+    function applyImageFallbacks(root) {
+      const messageImages = root.querySelectorAll('.mes_img_container img');
+      const imgs = messageImages.length ? messageImages : root.querySelectorAll('img');
+      imgs.forEach((img, index) => {
+        const imageData = imagesData[index];
+        if (!imageData) return;
 
-      img.src = originalSrc;
+        const originalSrc = imageData.originalSrc;
+        const thumbnail = imageData.thumbnail;
 
-      const fallbackToThumbnail = () => {
-        if (img.src !== thumbnail) {
-          img.src = thumbnail;
-        }
-      };
+        img.src = originalSrc;
 
-      img.onerror = fallbackToThumbnail;
+        const fallbackToThumbnail = () => {
+          if (img.src !== thumbnail) img.src = thumbnail;
+        };
 
-      const timeout = setTimeout(fallbackToThumbnail, 2000);
-      img.onload = () => clearTimeout(timeout);
-    });
+        img.onerror = fallbackToThumbnail;
+
+        const timeout = setTimeout(fallbackToThumbnail, 2000);
+        img.onload = () => {
+          clearTimeout(timeout);
+          if (legacyFrame) fitFavoriteFrame(legacyFrame);
+        };
+      });
+    }
   }
 
   function screenshotPages(content, frames, height, pageHeight) {
@@ -3170,9 +3377,8 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       });
     };
     addContentBounds(content, -origin);
-    for (const frame of frames) {
-      const frameBody = frame.contentDocument?.body;
-      if (frameBody) addContentBounds(frameBody, frame.getBoundingClientRect().top - origin);
+    for (const { frame, offset } of frames) {
+      if (frame.contentDocument?.body) addContentBounds(frame.contentDocument.body, offset + frame.getBoundingClientRect().top - origin);
     }
 
     occupied.sort((a, b) => a[0] - b[0]);
@@ -3227,7 +3433,9 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
     const replacements = [];
     const hiddenButtons = [];
-    const frames = Array.from(content.querySelectorAll(`${FRAME_MARKER} > iframe`));
+    const frameSelector = `${FRAME_MARKER} > iframe`;
+    const topFrames = Array.from(content.querySelectorAll(frameSelector));
+    const orderedFrames = [];
     let imageShadows = [];
     let savedPages = 0;
 
@@ -3248,11 +3456,20 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
         btn.style.display = 'none';
       });
 
-      await Promise.all(frames.map(frame => frameLoads.get(frame)));
-      await Promise.all([doc.fonts.ready, ...frames.map(frame => frame.contentDocument?.fonts?.ready)]);
+      await Promise.all(topFrames.map(frame => frameLoads.get(frame)));
+      function collectFrames(frames, offset = 0) {
+        for (const frame of frames) {
+          orderedFrames.push({ frame, offset });
+          const nested = frame.contentDocument?.querySelectorAll(frameSelector);
+          if (nested?.length) collectFrames(nested, offset + frame.getBoundingClientRect().top);
+        }
+      }
+
+      collectFrames(topFrames);
+      await Promise.all([doc.fonts.ready, ...orderedFrames.map(({ frame }) => frame.contentDocument?.fonts?.ready)]);
 
       if (shouldReplace && userName) {
-        const roots = [body, ...frames.map(frame => frame.contentDocument?.body).filter(Boolean)];
+        const roots = [body, ...orderedFrames.map(({ frame }) => frame.contentDocument?.body).filter(Boolean)];
         const pattern = new RegExp(escapeRegExp(userName), 'g');
         for (const root of roots) {
           const walker = root.ownerDocument.createTreeWalker(root, NodeFilter.SHOW_TEXT);
@@ -3275,7 +3492,11 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       content.style.overflow = 'visible';
       content.style.maxHeight = 'none';
       content.style.height = 'auto';
-      frames.forEach(fitFavoriteFrame);
+      for (const { frame } of orderedFrames.toReversed()) fitFavoriteFrame(frame);
+
+      // Capture offsets after layout expands and replacement text has been reflowed.
+      orderedFrames.length = 0;
+      collectFrames(topFrames);
 
       // 获取 SmartThemeBlurTintColor 并去掉透明度
       let themeBg = window.getComputedStyle(doc.body).getPropertyValue('--SmartThemeBlurTintColor').trim();
@@ -3297,14 +3518,15 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       if (isMobile) {
         body.querySelectorAll('img').forEach(img => {
           const originalShadow = img.style.boxShadow;
-          imageShadows.push({ element: img, originalShadow });
-          img.style.boxShadow = 'none';
+          const priority = img.style.getPropertyPriority('box-shadow');
+          imageShadows.push({ element: img, originalShadow, priority });
+          img.style.setProperty('box-shadow', 'none');
         });
       }
 
       const height = content.offsetHeight;
       const width = content.offsetWidth;
-      const pages = screenshotPages(content, frames, height, Math.floor(MAX_SCREENSHOT_HEIGHT_PX / scale));
+      const pages = screenshotPages(content, orderedFrames, height, Math.floor(MAX_SCREENSHOT_HEIGHT_PX / scale));
       const basename = `favorite-${Date.now()}`;
       if (pages.length > 1) notifier?.info?.(`正在分成 ${pages.length} 张 PNG 导出。`);
 
@@ -3345,7 +3567,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       content.style.overflow = originalContentOverflow;
       content.style.maxHeight = originalContentMaxHeight;
       content.style.height = originalContentHeight;
-      frames.forEach(fitFavoriteFrame);
+      for (const { frame } of orderedFrames.toReversed()) fitFavoriteFrame(frame);
       body.scrollTop = originalScrollTop;
 
       // 恢复UI按钮
@@ -3355,11 +3577,17 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
       // 恢复图片阴影（仅移动端）
       if (imageShadows.length > 0) {
-        imageShadows.forEach(({ element, originalShadow }) => {
-          element.style.boxShadow = originalShadow;
+        imageShadows.forEach(({ element, originalShadow, priority }) => {
+          element.style.setProperty('box-shadow', originalShadow, priority);
         });
       }
     }
+  }
+
+  function closeReadingModal() {
+    state.readingRequest++;
+    doc.getElementById(MODAL_ID)?.classList.remove('th-modal-visible');
+    state.modalVisible = false;
   }
 
   async function openReadingModal(fav, readingList = state.favorites) {
@@ -3459,7 +3687,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       </div>
     `;
 
-    renderFavoriteMarkup(modal.querySelector('.th-modal-message'), messageContent, `#${MODAL_ID} .th-modal-message`);
+    renderFavoriteMarkup(modal.querySelector('.th-modal-message'), messageContent, `#${MODAL_ID} .th-modal-message`, fav);
     attachReadingSize(modal);
 
     const closeBtn = modal.querySelector('.th-modal-close');
@@ -3470,13 +3698,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     const prevBtn = modal.querySelector('.th-modal-nav-prev');
     const nextBtn = modal.querySelector('.th-modal-nav-next');
 
-    const closeModal = () => {
-      state.readingRequest++;
-      modal.classList.remove('th-modal-visible');
-      state.modalVisible = false;
-    };
-
-    closeBtn.addEventListener('click', closeModal);
+    closeBtn.addEventListener('click', closeReadingModal);
     exportBtn.addEventListener('click', exportModalAsImage);
     editBtn.addEventListener('click', () => void openFavoriteEditor(fav, readingList));
     loadBtn?.addEventListener('click', async () => {
@@ -3506,7 +3728,10 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
       void openReadingModal(fav, readingList);
     });
-    backdrop.addEventListener('click', closeModal);
+    backdrop.addEventListener('click', event => {
+      event.stopPropagation();
+      closeReadingModal();
+    });
 
     if (hasPrev) {
       prevBtn.addEventListener('click', () => {
@@ -3524,17 +3749,6 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     state.modalVisible = true;
 
     processModalImages(modal, fav.images);
-  }
-
-  async function restoreLatestView() {
-    try {
-      const context = parentWin.SillyTavern.getContext();
-      await context.scrollChatToBottom({ waitForFrame: true });
-      notifier?.info?.('已恢复到最新视图');
-    } catch (error) {
-      logger.error('[ChatSearch] restoreLatestView failed:', error);
-      notifier?.error?.('恢复最新视图失败，请重试。');
-    }
   }
 
   function resolveMessageIdByPreview(chat, preview, originalFloor) {
@@ -3923,10 +4137,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     const backBtn = doc.createElement('button');
     backBtn.className = 'th-gallery-back';
     backBtn.innerHTML = '<i class="fa-solid fa-arrow-left"></i><span>返回</span>';
-    backBtn.addEventListener('click', () => {
-      state.selectedCharacter = null;
-      renderGalleryList();
-    });
+    backBtn.addEventListener('click', backFromGallery);
 
     elements.counter.textContent = `${char.name} (${char.favorites.length} 条收藏)`;
     elements.results.appendChild(backBtn);
@@ -4007,6 +4218,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
   function switchMode(mode) {
     if (!elements) return;
+    state.readingRequest++;
     state.currentMode = mode;
 
     elements.searchTab.classList.toggle('th-tab-active', mode === 'search');
@@ -4035,7 +4247,9 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     elements.panel.classList.toggle('th-hidden', !nextState);
     setActionsPopoverVisible(false);
 
-    if (nextState) {
+    if (!nextState) {
+      state.readingRequest++;
+    } else {
       // 打开面板时重新加载当前模式的数据
       if (state.currentMode === 'favorites' || state.currentMode === 'gallery') {
         void reloadFavorites();
@@ -4057,6 +4271,21 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
   function closePanel() {
     togglePanel(false);
+  }
+
+  function backFromGallery() {
+    state.readingRequest++;
+    renderGalleryList();
+  }
+
+  function backFromPanel() {
+    if (isActionsPopoverOpen()) {
+      setActionsPopoverVisible(false);
+    } else if (state.currentMode === 'gallery' && state.selectedCharacter) {
+      backFromGallery();
+    } else {
+      closePanel();
+    }
   }
 
   async function performSearch() {
@@ -4093,14 +4322,19 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     if (!elements) return;
 
     elements.closeBtn.addEventListener('click', () => closePanel());
+    elements.panelBackdrop.addEventListener('click', event => {
+      event.stopPropagation();
+      backFromPanel();
+    });
     elements.moreBtn.addEventListener('click', event => {
       event.preventDefault();
       event.stopPropagation();
       toggleActionsPopover();
     });
-    elements.latestBtn.addEventListener('click', () => {
-      setActionsPopoverVisible(false);
-      void restoreLatestView();
+    elements.heightSlider.addEventListener('input', () => applyPanelHeight(true));
+    elements.heightReset.addEventListener('click', () => {
+      elements.heightSlider.value = String(PANEL_HEIGHT_DEFAULT);
+      applyPanelHeight(true);
     });
     elements.exportBtn.addEventListener('click', () => {
       setActionsPopoverVisible(false);
@@ -4120,34 +4354,24 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       if (event.key === 'Enter') {
         event.preventDefault();
         performSearch();
-      } else if (event.key === 'Escape') {
-        event.stopPropagation();
-        closePanel();
       }
     });
 
-    if (state.docClickHandler) {
-      doc.removeEventListener('click', state.docClickHandler);
-    }
-    state.docClickHandler = event => {
-      if (!elements) return;
-      if (!isActionsPopoverOpen()) return;
-      if (elements.actionsMenu?.contains?.(event.target)) return;
-      setActionsPopoverVisible(false);
-    };
-    doc.addEventListener('click', state.docClickHandler);
+    elements.panel.addEventListener('click', event => {
+      if (isActionsPopoverOpen() && !elements.actionsMenu.contains(event.target)) setActionsPopoverVisible(false);
+    });
 
     state.keydownHandler = event => {
       const visible = elements.panel.classList.contains('th-visible');
 
-      if (event.key === 'Escape' && visible) {
-        if (isActionsPopoverOpen()) {
-          event.preventDefault();
-          event.stopPropagation();
-          setActionsPopoverVisible(false);
-          return;
-        }
-        closePanel();
+      if (event.key === 'Escape' && !doc.querySelector('dialog[open]')) {
+        const editor = doc.getElementById(EDITOR_ID);
+        if (editor) editor.remove();
+        else if (state.modalVisible) closeReadingModal();
+        else if (visible) backFromPanel();
+        else return;
+        event.preventDefault();
+        event.stopPropagation();
         return;
       }
 
@@ -4240,7 +4464,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
         switchMode('gallery');
         openPanel();
       },
-      version: '1.2.2',
+      version: '1.2.3',
     };
   }
 
