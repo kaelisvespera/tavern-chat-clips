@@ -31,6 +31,8 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   const PURGE_DELETED_PAYLOAD_FLAG = 'th-chat-search-purge-deleted-payload-v1';
   const FRAME_SOURCE = 'data-th-favorite-frame';
   const FRAME_MARKER = `[${FRAME_SOURCE}]`;
+  const PREVIEW_HOST = '.TH-render, .xiaobaix-iframe-wrapper, .mes-code-preview';
+  const STAGED_PREVIEW = '.mes-code-preview-placeholder, .mes-code-preview-pending';
   const frameLoads = new WeakMap();
 
   let db = null;
@@ -87,7 +89,12 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
   function favoriteMarkup(html) {
     const template = doc.createElement('template');
-    template.innerHTML = safeFavoriteHtml(html);
+    template.innerHTML = html;
+    template.content.querySelectorAll('iframe[srcdoc]').forEach(frame => {
+      replaceFavoriteFrame(frame, frame.getAttribute('srcdoc'));
+    });
+    addPreviewSources(template.content);
+    template.innerHTML = safeFavoriteHtml(template.innerHTML);
     return template;
   }
 
@@ -111,6 +118,99 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       return;
     }
     element.setAttribute(FRAME_SOURCE, encodeURIComponent(sanitizeFavoriteFrame(source)));
+  }
+
+  function replaceFavoriteFrame(frame, source) {
+    const placeholder = doc.createElement('div');
+    frame.replaceWith(placeholder);
+    saveFrameSource(placeholder, source);
+  }
+
+  function previewCode(host) {
+    const pre = host.matches('.TH-render') ? Array.from(host.children).find(child => child.matches('pre')) : host.nextElementSibling;
+    const source = pre?.matches('pre') ? pre.querySelector('code')?.textContent : '';
+    return source && /<(?:!doctype\s+html\b|[a-z][\w:-]*(?=[\s/>]))/i.test(source) ? source : '';
+  }
+
+  function addPreviewSources(fragment) {
+    for (const host of fragment.querySelectorAll(`${PREVIEW_HOST}, ${STAGED_PREVIEW}`)) {
+      if (!host.matches(FRAME_MARKER) && !host.querySelector(FRAME_MARKER)) {
+        const source = previewCode(host);
+        if (!source) continue;
+        saveFrameSource(host, source);
+      }
+
+      // These attributes belong to TT's temporary parked runtime, not the archived UI.
+      if (host.matches(STAGED_PREVIEW) || host.hasAttribute('data-tt-runtime-placeholder-height')
+        || (host.hasAttribute('inert') && host.getAttribute('aria-hidden') === 'true')) {
+        host.hidden = false;
+        host.style.removeProperty('height');
+        host.style.removeProperty('visibility');
+        host.removeAttribute('inert');
+        host.removeAttribute('aria-hidden');
+        host.removeAttribute('data-tt-runtime-placeholder-height');
+        host.removeAttribute('data-tt-runtime-iframe-height');
+      }
+      host.querySelectorAll('.tt-runtime-placeholder').forEach(placeholder => placeholder.remove());
+    }
+  }
+
+  function serializeRenderedFrame(frameDoc) {
+    const clone = frameDoc.documentElement.cloneNode(true);
+    const sheetSelector = 'style, link[rel~="stylesheet"]';
+    const sheets = Array.from(frameDoc.querySelectorAll(sheetSelector));
+    clone.querySelectorAll(sheetSelector).forEach((node, index) => {
+      try {
+        const sheet = sheets[index]?.sheet;
+        if (sheet?.disabled) {
+          node.remove();
+          return;
+        }
+        const rules = Array.from(sheet?.cssRules ?? [], rule => rule.cssText).join('\n');
+        if (!rules) return;
+        const style = frameDoc.createElement('style');
+        style.media = node.media;
+        style.textContent = rules;
+        node.replaceWith(style);
+      } catch {
+        // A cross-origin stylesheet may be visible but inaccessible through CSSOM.
+      }
+    });
+
+    const controls = 'input:not([type="password"]):not([type="file"]), textarea, option';
+    const liveControls = Array.from(frameDoc.querySelectorAll(controls));
+    clone.querySelectorAll(controls).forEach((node, index) => {
+      const live = liveControls[index];
+      if (node.matches('textarea')) node.textContent = live.value;
+      else if (node.matches('option')) node.toggleAttribute('selected', live.selected);
+      else if (['checkbox', 'radio'].includes(live.type)) node.toggleAttribute('checked', live.checked);
+      else node.setAttribute('value', live.value);
+    });
+    return clone.outerHTML;
+  }
+
+  async function readPreviewSource(frame, fallback) {
+    const frameDoc = frame.contentDocument;
+    const inline = frame.getAttribute('srcdoc');
+    const loadingLwb = frame.matches('.xiaobaix-iframe') && (/^加载中[.…]*$/.test(frameDoc?.body?.textContent?.trim() ?? '')
+      || /<body[^>]*>\s*加载中[.…]*\s*<\/body>/i.test(inline ?? ''));
+    if (loadingLwb) return fallback;
+    if (frameDoc?.body?.hasChildNodes()) return serializeRenderedFrame(frameDoc);
+    if (inline) return inline;
+
+    // Only read an in-page renderer Blob. Saved bookmarks never depend on its lifetime.
+    const blobUrl = frame.getAttribute('src');
+    if (blobUrl?.startsWith('blob:')) {
+      try {
+        const response = await parentWin.fetch(blobUrl);
+        if (response.ok && /^text\/html(?:;|$)/i.test(response.headers.get('Content-Type') ?? '')) {
+          return await response.text();
+        }
+      } catch {
+        // A renderer can revoke the Blob as it unmounts. Use the captured code block.
+      }
+    }
+    return fallback;
   }
 
   function fitFavoriteFrame(frame) {
@@ -677,6 +777,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     favorites: [],
     messageActionsObserver: null,
     modalVisible: false,
+    readingRequest: 0,
     galleryView: 'list',
     selectedCharacter: null,
     actionsPopoverOpen: false,
@@ -764,13 +865,14 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   --th-inline-bg-hover: color-mix(in srgb, var(--th-accent-color) 28%, transparent);
   --th-result-bg: color-mix(in srgb, var(--th-bg-color) 12%, transparent);
   --th-result-border: color-mix(in srgb, var(--th-border-color) 70%, transparent);
+  --th-panel-viewport-height: 100vh;
 
   position: fixed;
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
-  width: min(460px, calc(100vw - 48px));
-  max-height: min(620px, calc(100vh - 48px));
+  width: min(540px, calc(100vw - 48px));
+  max-height: min(760px, calc(var(--th-panel-viewport-height) - 32px));
   display: none;
   flex-direction: column;
   gap: 12px;
@@ -788,6 +890,16 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 }
 #${PANEL_ID}.th-hidden {
   display: none;
+}
+
+@supports (height: 100dvh) {
+  #${PANEL_ID} {
+    --th-panel-viewport-height: 100dvh;
+  }
+}
+
+#${PANEL_ID} > :not(#${RESULT_ID}) {
+  flex-shrink: 0;
 }
 
 #${PANEL_ID} .th-chat-search-header {
@@ -992,8 +1104,9 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   display: flex;
   flex-direction: column;
   gap: 8px;
+  min-height: 0;
   overflow-y: auto;
-  max-height: 220px;
+  overscroll-behavior-y: contain;
   padding-right: 4px;
   scrollbar-gutter: stable;
 }
@@ -1103,17 +1216,18 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
 @media (max-width: 900px) {
   #${PANEL_ID} {
-    width: min(420px, calc(100vw - 32px));
-    max-height: min(580px, calc(100vh - 36px));
+    width: min(500px, calc(100vw - 32px));
   }
 }
 
 @media (max-width: 680px) {
   #${PANEL_ID} {
-    top: calc(80px + env(safe-area-inset-top));
+    --th-panel-top: calc(clamp(12px, 9vh, 64px) + env(safe-area-inset-top, 0px));
+    --th-panel-bottom: max(12px, env(safe-area-inset-bottom, 0px));
+    top: var(--th-panel-top);
     transform: translateX(-50%);
     width: calc(100vw - 24px);
-    max-height: calc(100vh - env(safe-area-inset-top) - 96px);
+    max-height: min(760px, calc(var(--th-panel-viewport-height) - var(--th-panel-top) - var(--th-panel-bottom)));
     padding: 16px;
     border-radius: 12px;
   }
@@ -1127,13 +1241,8 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
 @media (max-width: 480px) {
   #${PANEL_ID} {
-    top: calc(80px + env(safe-area-inset-top));
     width: calc(100vw - 16px);
-    max-height: calc(100vh - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 96px);
     padding: 14px;
-  }
-  #${RESULT_ID} {
-    max-height: min(240px, 60vh);
   }
   #${PANEL_ID} .th-chat-search-result-actions {
     flex-wrap: nowrap;
@@ -2247,10 +2356,10 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
     let currentHtml = buildEditableHtmlFromFavorite(fav);
     if (!currentHtml && isFavoriteChat(fav)) {
-      const renderedContent = getRenderedMessageContent(fav.messageId);
+      const renderedContent = await getRenderedMessageContent(fav.messageId);
       currentHtml = renderedContent ? String(renderedContent) : '';
     }
-    currentHtml = restoreFavoritePresentation(fav, currentHtml);
+    currentHtml = await restoreFavoritePresentation(fav, currentHtml);
     const titleValue = String(fav.title ?? '');
     const subtitleValue = String(fav.subtitle ?? '');
 
@@ -2820,7 +2929,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     const characterAvatar = character?.avatar || 'unknown';
     const characterName = character?.name || message.name || '未知';
     const chatName = context?.chatMetadata?.name || context?.name2 || '未知聊天';
-    const renderedContent = getRenderedMessageContent(messageId);
+    const rendered = getRenderedMessageContent(messageId);
     const imgSelector = `#chat .mes[mesid="${messageId}"] .mes_img_container img`;
     const messageImages = Array.from(doc.querySelectorAll(imgSelector), img => ({
       src: img.currentSrc || img.src,
@@ -2832,7 +2941,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     if (title === null) return;
     const subtitle = await askText('选填：输入消息金句或关键台词');
     if (subtitle === null) return;
-    const images = await extractImagesData(messageImages);
+    const [renderedContent, images] = await Promise.all([rendered, extractImagesData(messageImages)]);
 
     const now = Date.now();
     const fav = {
@@ -2988,7 +3097,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     void openFavoriteEditor(fav);
   }
 
-  function getRenderedMessageContent(messageId) {
+  async function getRenderedMessageContent(messageId) {
     try {
       const chatContainer = getChatContainer();
       if (!chatContainer) return null;
@@ -3001,26 +3110,15 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
       const snapshot = mesText.cloneNode(true);
       const frames = Array.from(mesText.querySelectorAll('iframe'));
-      snapshot.querySelectorAll('iframe').forEach((frame, index) => {
-        const currentFrame = frames[index];
-        const frameDoc = currentFrame.contentDocument;
-        const rendered = frameDoc?.documentElement?.outerHTML;
-        const source = frameDoc?.body?.hasChildNodes() ? rendered : currentFrame.srcdoc || rendered;
-        const placeholder = doc.createElement('div');
-        frame.replaceWith(placeholder);
-        saveFrameSource(placeholder, source);
-      });
-      // TT can move the preview out of the source floor. Its hidden code block stays there.
-      snapshot.querySelectorAll('.mes-code-preview-placeholder').forEach(placeholder => {
-        const code = placeholder.nextElementSibling;
-        if (!code?.matches('pre[hidden]')) return;
-        saveFrameSource(placeholder, code.querySelector('code')?.textContent);
-        placeholder.hidden = false;
-      });
-
       const media = Array.from(mesElement.querySelectorAll('.mes_img_container'))
         .filter(container => !mesText.contains(container))
         .map(container => container.outerHTML).join('');
+      await Promise.all(Array.from(snapshot.querySelectorAll('iframe'), async (frame, index) => {
+        const host = frame.closest(PREVIEW_HOST);
+        const source = await readPreviewSource(frames[index], host ? previewCode(host) : '');
+        replaceFavoriteFrame(frame, source);
+      }));
+      addPreviewSources(snapshot);
       const content = safeFavoriteHtml(snapshot.innerHTML + media);
       if (frames.length && !snapshot.textContent.trim()
         && !snapshot.querySelector(`img, video, audio, ${FRAME_MARKER}`) && !media) return null;
@@ -3031,17 +3129,17 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     }
   }
 
-  function restoreFavoritePresentation(fav, html) {
+  async function restoreFavoritePresentation(fav, html) {
     // Recover presentation lost by older versions without replacing edited snapshots.
     if (!html || !isFavoriteChat(fav)) return html;
     const saved = favoriteMarkup(html);
     if (saved.content.querySelector(FRAME_MARKER)) return html;
-    const live = getRenderedMessageContent(fav.messageId);
+    const sourceMessage = parentWin.SillyTavern.getContext().chat[fav.messageId]?.mes;
+    const live = await getRenderedMessageContent(fav.messageId);
     if (!live) return html;
     const liveMarkup = favoriteMarkup(live);
     const previews = Array.from(liveMarkup.content.querySelectorAll(FRAME_MARKER));
-    const liveMessage = parentWin.SillyTavern.getContext().chat[fav.messageId];
-    if (previews.length && liveMessage?.mes === fav.message) {
+    if (previews.length && sourceMessage === fav.message) {
       const plain = favoriteMarkup(escapeHtml(fav.message).replace(/\r\n|\n|\r/g, '<br>'));
       if (plain.innerHTML.trim() === saved.innerHTML.trim()) return live;
       const stripped = liveMarkup.content.cloneNode(true);
@@ -3246,6 +3344,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   async function openReadingModal(fav, readingList = state.favorites) {
     const modal = doc.getElementById(MODAL_ID);
     if (!modal) return;
+    const request = ++state.readingRequest;
 
     try {
       await hydrateFavoritePayload(fav);
@@ -3270,7 +3369,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
     let messageContent = buildFavoriteContentHtml(fav);
     if (!messageContent && isFavoriteChat(fav)) {
-      const renderedContent = getRenderedMessageContent(fav.messageId);
+      const renderedContent = await getRenderedMessageContent(fav.messageId);
       messageContent = renderedContent || fav.message || '';
     }
 
@@ -3286,6 +3385,9 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
         messageContent = `<em>（该收藏未包含正文。点击“定位”从聊天记录加载，或用“导入”导入完整收藏。）</em>`;
       }
     }
+
+    messageContent = await restoreFavoritePresentation(fav, messageContent);
+    if (request !== state.readingRequest || !modal.isConnected) return;
 
     const prevBtnHtml = `
       <button class="th-modal-nav th-modal-nav-prev" aria-label="上一条收藏" ${!hasPrev ? 'disabled' : ''}>
@@ -3326,7 +3428,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       </div>
     `;
 
-    renderFavoriteMarkup(modal.querySelector('.th-modal-message'), restoreFavoritePresentation(fav, messageContent), `#${MODAL_ID} .th-modal-message`);
+    renderFavoriteMarkup(modal.querySelector('.th-modal-message'), messageContent, `#${MODAL_ID} .th-modal-message`);
 
     const closeBtn = modal.querySelector('.th-modal-close');
     const exportBtn = modal.querySelector('.th-modal-export');
@@ -3337,6 +3439,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     const nextBtn = modal.querySelector('.th-modal-nav-next');
 
     const closeModal = () => {
+      state.readingRequest++;
       modal.classList.remove('th-modal-visible');
       state.modalVisible = false;
     };
@@ -3351,7 +3454,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       });
       if (floor == null || hasAnyPayloadFields(fav) || !isFavoriteChat(fav)) return;
 
-      const renderedContent = getRenderedMessageContent(floor);
+      const renderedContent = await getRenderedMessageContent(floor);
       if (!renderedContent) {
         if (notifier?.warning) notifier.warning('未能从聊天记录加载正文，请先打开对应聊天后重试。');
         return;
@@ -4105,7 +4208,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
         switchMode('gallery');
         openPanel();
       },
-      version: '1.2.0',
+      version: '1.2.1',
     };
   }
 
