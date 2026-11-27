@@ -1,5 +1,6 @@
 // 原脚本：千秋梦。经授权移植到 TauriTavern。
 import { css } from '/lib.js';
+import { download } from '/scripts/utils.js';
 import { createTavernChatHelper, installChatSearchEntrypoints } from './tt-entry.js';
 import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
@@ -34,6 +35,12 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   const PREVIEW_HOST = '.TH-render, .xiaobaix-iframe-wrapper, .mes-code-preview';
   const STAGED_PREVIEW = '.mes-code-preview-placeholder, .mes-code-preview-pending';
   const frameLoads = new WeakMap();
+  const READING_SIZE_KEY = 'th-chat-search-reading-size';
+  const READING_SIZE_DEFAULT = 100;
+  const READING_SIZE_MIN = 80;
+  const READING_SIZE_MAX = 160;
+  const READING_SIZE_STEP = 10;
+  const MAX_SCREENSHOT_HEIGHT_PX = 4096;
 
   let db = null;
 
@@ -58,6 +65,47 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
   function safeFavoriteHtml(html) {
     return parentWin.DOMPurify.sanitize(html, { FORCE_BODY: true });
+  }
+
+  function loadReadingSize() {
+    try {
+      const saved = Number(parentWin.localStorage.getItem(READING_SIZE_KEY));
+      if (saved >= READING_SIZE_MIN && saved <= READING_SIZE_MAX && saved % READING_SIZE_STEP === 0) return saved;
+    } catch {
+      // Keep the default when browser preferences cannot be read.
+    }
+    return READING_SIZE_DEFAULT;
+  }
+
+  function attachReadingSize(modal) {
+    const content = modal.querySelector('.th-modal-content');
+    const smaller = modal.querySelector('[data-th-reading-step="-1"]');
+    const larger = modal.querySelector('[data-th-reading-step="1"]');
+    const reset = modal.querySelector('[data-th-reading-reset]');
+
+    function applySize() {
+      const size = state.readingSize;
+      content.style.setProperty('--th-reading-scale', String(size / 100));
+      smaller.disabled = size <= READING_SIZE_MIN;
+      larger.disabled = size >= READING_SIZE_MAX;
+      reset.textContent = `${size}%`;
+      reset.setAttribute('aria-label', `恢复默认字号，当前 ${size}%`);
+    }
+
+    function changeSize(size) {
+      state.readingSize = Math.max(READING_SIZE_MIN, Math.min(READING_SIZE_MAX, size));
+      applySize();
+      try {
+        parentWin.localStorage.setItem(READING_SIZE_KEY, String(state.readingSize));
+      } catch {
+        // The reading size stays usable for the current session.
+      }
+    }
+
+    smaller.addEventListener('click', () => changeSize(state.readingSize - READING_SIZE_STEP));
+    larger.addEventListener('click', () => changeSize(state.readingSize + READING_SIZE_STEP));
+    reset.addEventListener('click', () => changeSize(READING_SIZE_DEFAULT));
+    applySize();
   }
 
   function scopeFavoriteCss(source, scope) {
@@ -778,6 +826,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     messageActionsObserver: null,
     modalVisible: false,
     readingRequest: 0,
+    readingSize: loadReadingSize(),
     galleryView: 'list',
     selectedCharacter: null,
     actionsPopoverOpen: false,
@@ -1292,6 +1341,8 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
 .th-modal-content {
   position: relative;
+  display: flex;
+  flex-direction: column;
   width: min(680px, calc(100vw - 48px));
   max-height: calc(100vh - 96px);
   background: color-mix(in srgb, var(--SmartThemeBlurTintColor, rgba(18, 19, 27, 0.92)) 95%, transparent);
@@ -1315,104 +1366,77 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   }
 }
 
-.th-modal-close {
-  position: absolute;
-  top: 20px;
-  right: 20px;
-  background: none;
-  border: none;
-  color: var(--SmartThemeBodyColor, var(--text-color-high, #f5f6ff));
-  font-size: 28px;
-  line-height: 1;
-  width: 40px;
-  height: 40px;
-  cursor: pointer;
-  transition: opacity 0.2s ease, transform 0.2s ease;
-  z-index: 10;
+.th-modal-toolbar {
+  display: flex;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 2px 10px;
+  padding: 8px 12px 0;
+}
+
+.th-modal-font-controls,
+.th-modal-toolbar-actions {
   display: flex;
   align-items: center;
-  justify-content: center;
-  opacity: 0.7;
+  gap: 2px;
 }
 
-.th-modal-close:hover {
-  opacity: 1;
-  transform: rotate(90deg);
+.th-modal-toolbar-actions {
+  margin-inline-start: auto;
 }
 
-.th-modal-export {
-  position: absolute;
-  top: 20px;
-  right: 70px;
-  background: none;
-  border: none;
+.th-modal-font-label {
+  color: var(--SmartThemeEmColor, var(--SmartThemeBodyColor, #f5f6ff));
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.th-modal-toolbar button {
+  appearance: none;
+  display: grid;
+  place-items: center;
+  min-width: 40px;
+  min-height: 44px;
+  padding: 0 4px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
   color: var(--SmartThemeBodyColor, var(--text-color-high, #f5f6ff));
-  font-size: 14px;
+  font: inherit;
+  font-size: 15px;
   line-height: 1;
-  width: 40px;
-  height: 40px;
   cursor: pointer;
-  transition: opacity 0.2s ease, transform 0.2s ease;
-  z-index: 10;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  opacity: 0.7;
+  touch-action: manipulation;
 }
 
-.th-modal-export:hover {
-  opacity: 1;
-  transform: scale(1.1);
+.th-modal-toolbar button:hover:not(:disabled) {
+  background: color-mix(in srgb, currentColor 10%, transparent);
 }
 
-.th-modal-edit {
-  position: absolute;
-  top: 20px;
-  right: 120px;
-  background: none;
-  border: none;
-  color: var(--SmartThemeBodyColor, var(--text-color-high, #f5f6ff));
-  font-size: 14px;
-  line-height: 1;
-  width: 40px;
-  height: 40px;
-  cursor: pointer;
-  transition: opacity 0.2s ease, transform 0.2s ease;
-  z-index: 10;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  opacity: 0.7;
+.th-modal-toolbar button:focus-visible {
+  outline: 2px solid var(--SmartThemeQuoteColor, currentColor);
+  outline-offset: -2px;
 }
 
-.th-modal-edit:hover {
-  opacity: 1;
-  transform: scale(1.1);
+.th-modal-toolbar button:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
-.th-modal-load {
-  position: absolute;
-  top: 20px;
-  right: 170px;
-  background: none;
-  border: none;
-  color: var(--SmartThemeBodyColor, var(--text-color-high, #f5f6ff));
-  font-size: 14px;
-  line-height: 1;
-  width: 40px;
-  height: 40px;
-  cursor: pointer;
-  transition: opacity 0.2s ease, transform 0.2s ease;
-  z-index: 10;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  opacity: 0.7;
+.th-modal-toolbar [data-th-reading-step] {
+  font-size: 20px;
 }
 
-.th-modal-load:hover {
-  opacity: 1;
-  transform: scale(1.1);
+.th-modal-toolbar [data-th-reading-reset] {
+  min-width: 52px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.th-modal-toolbar .th-modal-close {
+  font-size: 24px;
 }
 
 .th-modal-nav {
@@ -1462,9 +1486,9 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 }
 
 .th-modal-body {
-  padding: 56px 64px;
+  min-height: 0;
+  padding: 24px 64px 56px;
   overflow-y: auto;
-  max-height: calc(100vh - 96px);
   text-align: center;
   /* Hide scrollbar while keeping content scrollable */
   -ms-overflow-style: none; /* IE, Edge */
@@ -1519,7 +1543,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 }
 
 .th-modal-subtitle {
-  font-size: 1.14em;
+  font-size: calc(1.14em * var(--th-reading-scale, 1));
   line-height: 1.75;
   color: var(--SmartThemeEmColor, rgba(255, 255, 255, 0.7));
   margin: 28px auto 44px;
@@ -1552,7 +1576,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 }
 
 .th-modal-message {
-  font-size: 1.14em;
+  font-size: calc(1.14em * var(--th-reading-scale, 1));
   line-height: 1.9;
   color: var(--SmartThemeBodyColor, var(--text-color-high, #f5f6ff));
   margin: 0 auto 40px;
@@ -1676,8 +1700,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   }
 
   .th-modal-body {
-    padding: 44px 36px;
-    max-height: calc(100vh - 64px);
+    padding: 16px 36px 44px;
   }
 
   .th-modal-title {
@@ -1691,48 +1714,16 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   }
 
   .th-modal-subtitle {
-    font-size: 15px;
+    font-size: calc(15px * var(--th-reading-scale, 1));
     max-width: 85%;
     padding: 14px 28px;
     margin: 24px auto 40px;
   }
 
   .th-modal-message {
-    font-size: 15px;
+    font-size: calc(15px * var(--th-reading-scale, 1));
     line-height: 1.8;
     max-width: 95%;
-  }
-
-  .th-modal-close {
-    top: 16px;
-    right: 16px;
-    width: 36px;
-    height: 36px;
-    font-size: 24px;
-  }
-
-  .th-modal-export {
-    top: 16px;
-    right: 62px;
-    width: 36px;
-    height: 36px;
-    font-size: 16px;
-  }
-
-  .th-modal-edit {
-    top: 16px;
-    right: 108px;
-    width: 36px;
-    height: 36px;
-    font-size: 16px;
-  }
-
-  .th-modal-load {
-    top: 16px;
-    right: 154px;
-    width: 36px;
-    height: 36px;
-    font-size: 16px;
   }
 
   .th-modal-nav {
@@ -1762,8 +1753,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   }
 
   .th-modal-body {
-    padding: 30px 22px;
-    max-height: calc(100vh - 140px);
+    padding: 12px 22px 30px;
   }
 
   .th-modal-title {
@@ -1777,14 +1767,14 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
   }
 
   .th-modal-subtitle {
-    font-size: 14px;
+    font-size: calc(14px * var(--th-reading-scale, 1));
     margin: 20px auto 36px;
     max-width: 90%;
     padding: 12px 24px;
   }
 
   .th-modal-message {
-    font-size: 14px;
+    font-size: calc(14px * var(--th-reading-scale, 1));
     line-height: 1.75;
     margin-bottom: 32px;
     max-width: 100%;
@@ -1798,38 +1788,6 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
 
   .th-modal-meta::before {
     width: 50%;
-  }
-
-  .th-modal-close {
-    top: 12px;
-    right: 12px;
-    width: 32px;
-    height: 32px;
-    font-size: 22px;
-  }
-
-  .th-modal-export {
-    top: 12px;
-    right: 54px;
-    width: 32px;
-    height: 32px;
-    font-size: 14px;
-  }
-
-  .th-modal-edit {
-    top: 12px;
-    right: 94px;
-    width: 32px;
-    height: 32px;
-    font-size: 14px;
-  }
-
-  .th-modal-load {
-    top: 12px;
-    right: 134px;
-    width: 32px;
-    height: 32px;
-    font-size: 14px;
   }
 
   .th-modal-nav {
@@ -2347,9 +2305,6 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       logger.warn('[ChatSearch] failed to load favorite payload:', error);
     }
 
-    const existing = doc.getElementById(EDITOR_ID);
-    if (existing) existing.remove();
-
     const wrapper = doc.createElement('div');
     wrapper.id = EDITOR_ID;
     wrapper.className = 'th-fav-editor';
@@ -2393,6 +2348,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       </div>
     `;
 
+    doc.getElementById(EDITOR_ID)?.remove();
     doc.body.appendChild(wrapper);
 
     const backdrop = wrapper.querySelector('.th-fav-editor-backdrop');
@@ -3190,6 +3146,56 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     });
   }
 
+  function screenshotPages(content, frames, height, pageHeight) {
+    if (height <= pageHeight) return [{ top: 0, height }];
+
+    const origin = content.getBoundingClientRect().top;
+    const occupied = [];
+    const addContentBounds = (root, offset) => {
+      const range = root.ownerDocument.createRange();
+      const walker = root.ownerDocument.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      let textNode;
+      while ((textNode = walker.nextNode())) {
+        if (!textNode.data.trim() || textNode.parentElement?.closest('style, script')) continue;
+        range.selectNodeContents(textNode);
+        for (const rect of range.getClientRects()) {
+          if (rect.height > 0) occupied.push([Math.floor(rect.top + offset), Math.ceil(rect.bottom + offset)]);
+        }
+      }
+      root.querySelectorAll('img, svg, canvas, video').forEach(element => {
+        const rect = element.getBoundingClientRect();
+        if (rect.height > 0 && rect.height < pageHeight) {
+          occupied.push([Math.floor(rect.top + offset), Math.ceil(rect.bottom + offset)]);
+        }
+      });
+    };
+    addContentBounds(content, -origin);
+    for (const frame of frames) {
+      const frameBody = frame.contentDocument?.body;
+      if (frameBody) addContentBounds(frameBody, frame.getBoundingClientRect().top - origin);
+    }
+
+    occupied.sort((a, b) => a[0] - b[0]);
+    const merged = [];
+    for (const [top, bottom] of occupied) {
+      const previous = merged.at(-1);
+      if (previous && previous[1] > top) previous[1] = Math.max(previous[1], bottom);
+      else merged.push([top, bottom]);
+    }
+
+    const pages = [];
+    let block = 0;
+    for (let top = 0; top < height;) {
+      let bottom = Math.min(height, top + pageHeight);
+      while (block < merged.length && merged[block][1] <= bottom) block++;
+      const crossing = merged[block];
+      if (bottom < height && crossing && crossing[0] > top && crossing[0] < bottom) bottom = crossing[0];
+      pages.push({ top, height: bottom - top });
+      top = bottom;
+    }
+    return pages;
+  }
+
   async function exportModalAsImage() {
     const modal = doc.getElementById(MODAL_ID);
     if (!modal || !state.modalVisible) return;
@@ -3213,6 +3219,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     const originalBodyOverflow = body.style.overflow;
     const originalBodyMaxHeight = body.style.maxHeight;
     const originalBodyQuotes = body.style.quotes;
+    const originalScrollTop = body.scrollTop;
 
     const originalContentOverflow = content.style.overflow;
     const originalContentMaxHeight = content.style.maxHeight;
@@ -3222,17 +3229,9 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     const hiddenButtons = [];
     const frames = Array.from(content.querySelectorAll(`${FRAME_MARKER} > iframe`));
     let imageShadows = [];
+    let savedPages = 0;
 
     try {
-      // 隐藏UI按钮
-      const buttonsToHide = content.querySelectorAll(
-        '.th-modal-close, .th-modal-export, .th-modal-edit, .th-modal-load, .th-modal-nav',
-      );
-      buttonsToHide.forEach(btn => {
-        hiddenButtons.push({ element: btn, originalDisplay: btn.style.display });
-        btn.style.display = 'none';
-      });
-
       const context = parentWin.SillyTavern?.getContext?.();
       const userName = context?.name1;
       let shouldReplace = false;
@@ -3242,6 +3241,12 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
         if (choice === null) return;
         if (choice === '1') shouldReplace = true;
       }
+
+      const buttonsToHide = content.querySelectorAll('.th-modal-toolbar, .th-modal-nav');
+      buttonsToHide.forEach(btn => {
+        hiddenButtons.push({ element: btn, originalDisplay: btn.style.display });
+        btn.style.display = 'none';
+      });
 
       await Promise.all(frames.map(frame => frameLoads.get(frame)));
       await Promise.all([doc.fonts.ready, ...frames.map(frame => frame.contentDocument?.fonts?.ready)]);
@@ -3297,21 +3302,36 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
         });
       }
 
-      const dataUrl = await screenshotLib.domToPng(content, {
-        quality: 0.8,
-        backgroundColor: opaqueBg,
-        scale: scale,
-      });
+      const height = content.offsetHeight;
+      const width = content.offsetWidth;
+      const pages = screenshotPages(content, frames, height, Math.floor(MAX_SCREENSHOT_HEIGHT_PX / scale));
+      const basename = `favorite-${Date.now()}`;
+      if (pages.length > 1) notifier?.info?.(`正在分成 ${pages.length} 张 PNG 导出。`);
 
-      const link = doc.createElement('a');
-      link.download = `favorite-${Date.now()}.png`;
-      link.href = dataUrl;
-      doc.body.appendChild(link);
-      link.click();
-      link.remove();
+      for (const [index, page] of pages.entries()) {
+        const options = { quality: 0.8, backgroundColor: opaqueBg, scale };
+        if (pages.length > 1) {
+          options.width = width;
+          options.height = page.height;
+          options.onCloneNode = clone => clone.style.setProperty('height', `${height}px`, 'important');
+          options.onCreateForeignObjectSvg = svg => {
+            // Draw this page directly at full resolution over the full layout.
+            const foreignObject = svg.querySelector('foreignObject');
+            foreignObject.setAttribute('height', String(height));
+            foreignObject.setAttribute('y', String(-page.top));
+          };
+        }
+        const image = await screenshotLib.domToPng(content, options);
+        const blob = await (await parentWin.fetch(image)).blob();
+        const pageNumber = String(index + 1).padStart(Math.max(2, String(pages.length).length), '0');
+        const fileName = pages.length > 1 ? `${basename}-${pageNumber}.png` : `${basename}.png`;
+        const result = await download(blob, fileName, 'image/png', { throwOnFailure: true });
+        if (result?.delivered === false) break;
+        savedPages++;
+      }
     } catch (error) {
       logger.error('[ChatSearch] failed to export screenshot:', error);
-      notifier?.error?.('导出截图失败，详见控制台。');
+      notifier?.error?.(savedPages ? `导出中断，已保存 ${savedPages} 张 PNG。` : '导出截图失败，详见控制台。');
     } finally {
       // 恢复用户名
       replacements.forEach(({ node, original }) => {
@@ -3326,6 +3346,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
       content.style.maxHeight = originalContentMaxHeight;
       content.style.height = originalContentHeight;
       frames.forEach(fitFavoriteFrame);
+      body.scrollTop = originalScrollTop;
 
       // 恢复UI按钮
       hiddenButtons.forEach(({ element, originalDisplay }) => {
@@ -3404,16 +3425,26 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     modal.innerHTML = `
       <div class="th-modal-backdrop"></div>
       <div class="th-modal-content">
-        <button class="th-modal-close" aria-label="关闭">&times;</button>
-        <button class="th-modal-export" aria-label="导出截图" title="导出截图">
-          <i class="fa-solid fa-download"></i>
-        </button>
-        <button class="th-modal-edit" aria-label="编辑收藏" title="编辑收藏">
-          <i class="fa-solid fa-pen-to-square"></i>
-        </button>
-        <button class="th-modal-load" aria-label="定位到原消息" title="定位到原消息">
-          <i class="fa-solid fa-location-arrow"></i>
-        </button>
+        <div class="th-modal-toolbar">
+          <div class="th-modal-font-controls" role="group" aria-label="阅读字号">
+            <span class="th-modal-font-label" aria-hidden="true">字号</span>
+            <button type="button" data-th-reading-step="-1" aria-label="缩小字号" title="缩小字号">−</button>
+            <button type="button" data-th-reading-reset aria-label="当前字号 100%，恢复默认字号" title="恢复默认字号">100%</button>
+            <button type="button" data-th-reading-step="1" aria-label="放大字号" title="放大字号">+</button>
+          </div>
+          <div class="th-modal-toolbar-actions" role="group" aria-label="收藏阅读操作">
+            <button type="button" class="th-modal-load" aria-label="定位到原消息" title="定位到原消息">
+              <i class="fa-solid fa-location-arrow" aria-hidden="true"></i>
+            </button>
+            <button type="button" class="th-modal-edit" aria-label="编辑收藏" title="编辑收藏">
+              <i class="fa-solid fa-pen-to-square" aria-hidden="true"></i>
+            </button>
+            <button type="button" class="th-modal-export" aria-label="导出截图" title="导出截图">
+              <i class="fa-solid fa-download" aria-hidden="true"></i>
+            </button>
+            <button type="button" class="th-modal-close" aria-label="关闭" title="关闭">&times;</button>
+          </div>
+        </div>
         ${prevBtnHtml}
         ${nextBtnHtml}
         <div class="th-modal-body">
@@ -3429,6 +3460,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
     `;
 
     renderFavoriteMarkup(modal.querySelector('.th-modal-message'), messageContent, `#${MODAL_ID} .th-modal-message`);
+    attachReadingSize(modal);
 
     const closeBtn = modal.querySelector('.th-modal-close');
     const exportBtn = modal.querySelector('.th-modal-export');
@@ -4208,7 +4240,7 @@ import { convertV1Backup, readV1Favorites } from './v1-migration.js';
         switchMode('gallery');
         openPanel();
       },
-      version: '1.2.1',
+      version: '1.2.2',
     };
   }
 
